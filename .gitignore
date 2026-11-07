@@ -33,7 +33,6 @@ pubspec.lock
 .pub-cache/
 .pub/
 /build/
-/web/
 
 # Symbolication related
 app.*.symbols

@@ -3,6 +3,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/app_export.dart';
 import '../../services/supabase_service.dart';
+import '../../widgets/app_navigation.dart';
 import '../user_profile_screen/user_profile_screen.dart';
 import './widgets/chat_detail_view.dart';
 import './widgets/conversation_card_widget.dart';
@@ -20,6 +21,9 @@ class _ChatScreenState extends State<ChatScreen>
   String? _openConversationId;
   bool _isLoadingConversations = true;
   bool _isLoadingGroups = true;
+  bool _isSearchActive = false;
+  String _searchQuery = '';
+  final TextEditingController _searchController = TextEditingController();
 
   final List<Map<String, dynamic>> _conversationsMaps = [];
   final List<Map<String, dynamic>> _groups = [];
@@ -45,6 +49,7 @@ class _ChatScreenState extends State<ChatScreen>
     _messagesChannel?.unsubscribe();
     _profilesChannel?.unsubscribe();
     _tabController.dispose();
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -204,6 +209,25 @@ class _ChatScreenState extends State<ChatScreen>
     try {
       final rows = await SupabaseService.instance.fetchConversations();
       if (!mounted) return;
+      final uid = SupabaseService.instance.currentUserId;
+
+      // Fetch all block relationships involving the current user once
+      Set<String> blockedUserIds = {};
+      if (uid != null) {
+        try {
+          final blockRows = await SupabaseService.instance.client
+              .from('blocked_users')
+              .select('blocker_id, blocked_user_id')
+              .or('blocker_id.eq.$uid,blocked_user_id.eq.$uid');
+          for (final b in (blockRows as List)) {
+            final blocker = b['blocker_id'] as String?;
+            final blocked = b['blocked_user_id'] as String?;
+            if (blocker == uid && blocked != null) blockedUserIds.add(blocked);
+            if (blocked == uid && blocker != null) blockedUserIds.add(blocker);
+          }
+        } catch (_) {}
+      }
+
       final mapped = <Map<String, dynamic>>[];
       for (final row in rows) {
         final conv = row['conversation'] as Map<String, dynamic>? ?? {};
@@ -211,9 +235,61 @@ class _ChatScreenState extends State<ChatScreen>
         final convId = conv['id'] ?? row['conversation_id'] ?? '';
 
         // Use pre-fetched profile data from the enriched row
-        final otherUserId = row['_otherUserId'] as String?;
-        final otherName = row['_otherName'] as String? ?? 'Conversa';
-        final otherImageUrl = row['_otherAvatarUrl'] as String? ?? '';
+        String? otherUserId = row['_otherUserId'] as String?;
+        String otherName = row['_otherName'] as String? ?? 'Conversa';
+        String otherImageUrl = row['_otherAvatarUrl'] as String? ?? '';
+
+        // Fallback: if otherUserId is null (RLS blocked participants table),
+        // find the other user from messages
+        if (!isGroup && otherUserId == null && convId.toString().isNotEmpty) {
+          try {
+            final msgRows = await SupabaseService.instance.client
+                .from('messages')
+                .select('sender_id')
+                .eq('conversation_id', convId.toString())
+                .neq('sender_id', uid ?? '')
+                .limit(1);
+            if (msgRows.isNotEmpty) {
+              otherUserId = msgRows.first['sender_id'] as String?;
+            }
+          } catch (_) {}
+        }
+
+        // Skip conversations with blocked users (either direction)
+        if (!isGroup &&
+            otherUserId != null &&
+            blockedUserIds.contains(otherUserId)) {
+          continue;
+        }
+
+        // Fallback: if name is still default, try fetching profile directly
+        if ((otherName == 'Conversa' || otherName.isEmpty) &&
+            otherUserId != null) {
+          try {
+            final profile = await SupabaseService.instance.fetchUserProfile(
+              otherUserId,
+            );
+            if (profile != null) {
+              otherName = (profile['full_name'] as String?)?.isNotEmpty == true
+                  ? profile['full_name'] as String
+                  : (profile['username'] as String? ?? 'Usuário');
+              final rawAvatar = profile['avatar_url'] as String? ?? '';
+              if (rawAvatar.isNotEmpty &&
+                  !rawAvatar.startsWith('http://') &&
+                  !rawAvatar.startsWith('https://')) {
+                try {
+                  otherImageUrl = SupabaseService.instance.client.storage
+                      .from('avatars')
+                      .getPublicUrl(rawAvatar);
+                } catch (_) {
+                  otherImageUrl = rawAvatar;
+                }
+              } else {
+                otherImageUrl = rawAvatar;
+              }
+            }
+          } catch (_) {}
+        }
 
         debugPrint(
           'DEBUG CHAT -> Usuário: $otherName | AvatarURL: $otherImageUrl',
@@ -256,7 +332,7 @@ class _ChatScreenState extends State<ChatScreen>
               'name': g['name'] ?? '',
               'description': g['description'] ?? '',
               'members': g['members_count'] ?? 0,
-              'imageUrl': g['avatar_url'] ?? '',
+              'imageUrl': g['cover_url'] ?? g['avatar_url'] ?? '',
               'imageSemantic': 'Imagem do grupo ${g['name'] ?? ''}',
             },
           )
@@ -292,6 +368,19 @@ class _ChatScreenState extends State<ChatScreen>
       .where((c) => c['isNewRequest'] == true && c['isGroup'] != true)
       .toList();
 
+  List<Map<String, dynamic>> get _filteredConversations {
+    final all = _allConversations
+        .where((c) => c['isNewRequest'] != true)
+        .toList();
+    if (_searchQuery.trim().isEmpty) return all;
+    final q = _searchQuery.trim().toLowerCase();
+    return all.where((c) {
+      final name = (c['name'] as String? ?? '').toLowerCase();
+      final last = (c['lastMessage'] as String? ?? '').toLowerCase();
+      return name.contains(q) || last.contains(q);
+    }).toList();
+  }
+
   int get _totalUnread =>
       _conversationsMaps.fold(0, (sum, c) => sum + (c['unreadCount'] as int));
 
@@ -301,6 +390,8 @@ class _ChatScreenState extends State<ChatScreen>
       final idx = _conversationsMaps.indexWhere((c) => c['id'] == conv['id']);
       if (idx != -1) _conversationsMaps[idx]['unreadCount'] = 0;
     });
+    // Signal the nav bar to clear the message badge immediately
+    messageBadgeResetNotifier.value = true;
   }
 
   void _openUserProfile(String? userId) {
@@ -409,24 +500,60 @@ class _ChatScreenState extends State<ChatScreen>
               child: Row(
                 children: [
                   Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('Mensagens', style: theme.textTheme.headlineSmall),
-                        if (_totalUnread > 0)
-                          Text(
-                            '$_totalUnread não lidas',
-                            style: theme.textTheme.bodySmall?.copyWith(
-                              color: AppTheme.primary,
-                              fontWeight: FontWeight.w600,
+                    child: _isSearchActive
+                        ? TextField(
+                            controller: _searchController,
+                            autofocus: true,
+                            onChanged: (v) => setState(() => _searchQuery = v),
+                            decoration: InputDecoration(
+                              hintText: 'Buscar conversa...',
+                              prefixIcon: const Icon(Icons.search_rounded),
+                              filled: true,
+                              fillColor:
+                                  theme.colorScheme.surfaceContainerHighest,
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                borderSide: BorderSide.none,
+                              ),
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 10,
+                              ),
                             ),
+                          )
+                        : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Mensagens',
+                                style: theme.textTheme.headlineSmall,
+                              ),
+                              if (_totalUnread > 0)
+                                Text(
+                                  '$_totalUnread não lidas',
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: AppTheme.primary,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                            ],
                           ),
-                      ],
-                    ),
                   ),
                   IconButton(
-                    onPressed: () {},
-                    icon: const Icon(Icons.search_rounded),
+                    onPressed: () {
+                      setState(() {
+                        _isSearchActive = !_isSearchActive;
+                        if (!_isSearchActive) {
+                          _searchQuery = '';
+                          _searchController.clear();
+                        }
+                      });
+                    },
+                    icon: Icon(
+                      _isSearchActive
+                          ? Icons.close_rounded
+                          : Icons.search_rounded,
+                    ),
                     style: IconButton.styleFrom(
                       backgroundColor: AppTheme.primary.withAlpha(20),
                       foregroundColor: AppTheme.primary,
@@ -449,13 +576,15 @@ class _ChatScreenState extends State<ChatScreen>
         child: CircularProgressIndicator(color: AppTheme.primary),
       );
     }
-    final requests = _newRequests;
-    final all = _allConversations;
+    final requests = _isSearchActive ? <Map<String, dynamic>>[] : _newRequests;
+    final all = _filteredConversations;
 
     if (all.isEmpty && requests.isEmpty) {
       return _buildEmptyState(
         theme,
-        'Nenhuma conversa ainda',
+        _isSearchActive && _searchQuery.isNotEmpty
+            ? 'Nenhuma conversa encontrada'
+            : 'Nenhuma conversa ainda',
         Icons.chat_bubble_outline_rounded,
       );
     }
@@ -513,14 +642,12 @@ class _ChatScreenState extends State<ChatScreen>
             ),
           ),
         ],
-        ...all
-            .where((c) => c['isNewRequest'] != true)
-            .map(
-              (conv) => ConversationCardWidget(
-                conversation: conv,
-                onTap: () => _openConversation(conv),
-              ),
-            ),
+        ...all.map(
+          (conv) => ConversationCardWidget(
+            conversation: conv,
+            onTap: () => _openConversation(conv),
+          ),
+        ),
       ],
     );
   }

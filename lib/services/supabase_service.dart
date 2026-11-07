@@ -1,7 +1,9 @@
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:dio/dio.dart';
 
 import './avatar_notifier.dart';
+import '../core/services/aiIntegrations/chat_completion_service.dart';
 
 class SupabaseService {
   static SupabaseService? _instance;
@@ -28,6 +30,11 @@ class SupabaseService {
     await Supabase.initialize(
       url: supabaseUrl,
       anonKey: supabaseAnonKey,
+      authOptions: FlutterAuthClientOptions(
+        // Use implicit flow on web to avoid CORS/preflight issues with PKCE
+        // Use PKCE on mobile for better security
+        authFlowType: kIsWeb ? AuthFlowType.implicit : AuthFlowType.pkce,
+      ),
       realtimeClientOptions: const RealtimeClientOptions(
         logLevel: RealtimeLogLevel.info,
       ),
@@ -52,14 +59,108 @@ class SupabaseService {
     String? fullName,
     String? username,
   }) async {
-    return await client.auth.signUp(
-      email: email,
-      password: password,
-      data: {
-        if (fullName != null) 'full_name': fullName,
-        if (username != null) 'username': username,
-      },
-    );
+    // Completely different approach: use dio to call Supabase Auth REST API directly.
+    // This bypasses the SDK's internal fetch/XMLHttpRequest mechanism that causes
+    // "Failed to fetch" / "AuthRetryableFetchException" errors on web.
+    try {
+      final dio = Dio(
+        BaseOptions(
+          baseUrl: supabaseUrl,
+          connectTimeout: const Duration(seconds: 15),
+          receiveTimeout: const Duration(seconds: 15),
+          headers: {
+            'apikey': supabaseAnonKey,
+            'Content-Type': 'application/json',
+          },
+        ),
+      );
+
+      final response = await dio.post(
+        '/auth/v1/signup',
+        data: {
+          'email': email,
+          'password': password,
+          'data': {
+            if (fullName != null) 'full_name': fullName,
+            if (username != null) 'username': username,
+          },
+        },
+      );
+
+      final body = response.data as Map<String, dynamic>;
+
+      // Parse user from response
+      final userJson = body['user'] as Map<String, dynamic>?;
+      final sessionJson = body['session'] as Map<String, dynamic>?;
+
+      if (userJson == null) {
+        throw AuthException('Não foi possível criar a conta. Tente novamente.');
+      }
+
+      // If we got a session from the direct call, set it in the Supabase client
+      if (sessionJson != null) {
+        final accessToken = sessionJson['access_token'] as String?;
+        final refreshToken = sessionJson['refresh_token'] as String?;
+        if (accessToken != null && refreshToken != null) {
+          try {
+            await client.auth.setSession(accessToken);
+          } catch (_) {
+            // setSession may fail if token format differs — fall back to signIn
+          }
+        }
+      }
+
+      // Fall back to the SDK signUp to get a proper AuthResponse object
+      // Now that we know the network works via dio, the SDK call should also work.
+      // If the direct call succeeded but SDK still fails, sign in instead.
+      try {
+        return await client.auth.signUp(
+          email: email,
+          password: password,
+          data: {
+            if (fullName != null) 'full_name': fullName,
+            if (username != null) 'username': username,
+          },
+        );
+      } catch (sdkErr) {
+        // SDK failed but dio succeeded — try signing in to get a proper session
+        debugPrint(
+          'SDK signUp failed after dio success, trying signIn: $sdkErr',
+        );
+        try {
+          return await client.auth.signInWithPassword(
+            email: email,
+            password: password,
+          );
+        } catch (signInErr) {
+          // Account was created (dio succeeded), user needs to confirm email or retry login
+          debugPrint('signIn after dio signup also failed: $signInErr');
+          // Return a minimal response indicating success without session
+          // by re-throwing the original SDK error so the caller can handle it
+          rethrow;
+        }
+      }
+    } on DioException catch (dioErr) {
+      debugPrint('Dio signUp error: ${dioErr.type} — ${dioErr.message}');
+      final responseData = dioErr.response?.data;
+      if (responseData is Map) {
+        final msg =
+            responseData['msg'] ??
+            responseData['message'] ??
+            responseData['error_description'] ??
+            '';
+        final code = responseData['error_code'] ?? responseData['code'] ?? '';
+        if (msg.toString().contains('already registered') ||
+            code.toString().contains('user_already_exists')) {
+          throw AuthException('User already registered');
+        }
+        if (msg.toString().isNotEmpty) {
+          throw AuthException(msg.toString());
+        }
+      }
+      // Network-level failure — rethrow as a recognizable error
+      throw AuthException('Failed to fetch');
+    }
   }
 
   Future<AuthResponse> signIn({
@@ -77,6 +178,69 @@ class SupabaseService {
   }
 
   Stream<AuthState> get authStateChanges => client.auth.onAuthStateChange;
+
+  // ─────────────────────────────────────────────────────────────
+  // AUTH SECURITY — User Existence Check, 2FA, Session Management
+  // ─────────────────────────────────────────────────────────────
+
+  /// Checks if a user account exists for the given email.
+  /// Returns true if the account exists, false otherwise.
+  /// This prevents auto-creation of accounts during login.
+  Future<bool> checkIfUserExists(String email) async {
+    try {
+      // Query user_profiles by email to check existence
+      final data = await client
+          .from('user_profiles')
+          .select('id')
+          .eq('email', email.trim().toLowerCase())
+          .maybeSingle();
+      return data != null;
+    } catch (e) {
+      debugPrint('checkIfUserExists error: $e');
+      // On error, allow the login attempt to proceed (signIn will fail with proper error)
+      return true;
+    }
+  }
+
+  /// Sends a 2FA verification code to the user's email via edge function.
+  Future<void> send2FACode({required String email}) async {
+    try {
+      final supabaseUrl = SupabaseService.supabaseUrl;
+      final anonKey = SupabaseService.supabaseAnonKey;
+      final response = await client.functions.invoke(
+        'send-2fa-code',
+        body: {'email': email},
+      );
+      if (response.status != 200) {
+        throw Exception('Falha ao enviar código 2FA.');
+      }
+    } catch (e) {
+      debugPrint('send2FACode error: $e');
+      rethrow;
+    }
+  }
+
+  /// Verifies a 2FA code for the given email.
+  /// Returns true if the code is valid and not expired.
+  Future<bool> verify2FACode({
+    required String email,
+    required String code,
+  }) async {
+    try {
+      final response = await client.functions.invoke(
+        'verify-2fa-code',
+        body: {'email': email, 'code': code},
+      );
+      if (response.status == 200) {
+        final data = response.data as Map<String, dynamic>?;
+        return data?['verified'] == true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint('verify2FACode error: $e');
+      return false;
+    }
+  }
 
   // ─────────────────────────────────────────────────────────────
   // USER PROFILES
@@ -197,8 +361,8 @@ class SupabaseService {
   }
 
   Future<List<Map<String, dynamic>>> searchUsers(String query) async {
-    // Require at least 2 characters to prevent full-table scans
-    if (query.trim().length < 2) return [];
+    // Require at least 1 character
+    if (query.trim().isEmpty) return [];
     // Sanitize: limit query length
     final safeQuery = query.trim().substring(
       0,
@@ -207,7 +371,11 @@ class SupabaseService {
     try {
       final data = await client
           .from('user_profiles')
-          .select()
+          .select(
+            'id, full_name, username, avatar_url, bio, neurodiv_type, '
+            'hyperfocuses, interests, communication_styles, values_and_ideas, '
+            'communication_preferences',
+          )
           .or('full_name.ilike.%$safeQuery%,username.ilike.%$safeQuery%')
           .limit(20);
       return List<Map<String, dynamic>>.from(data);
@@ -262,6 +430,7 @@ class SupabaseService {
           .select()
           .eq('author_id', userId)
           .eq('is_published', true)
+          .neq('post_type', 'diary')
           .order('created_at', ascending: false);
       return List<Map<String, dynamic>>.from(data);
     } catch (e) {
@@ -275,6 +444,7 @@ class SupabaseService {
     String? imageUrl,
     String? imageSemantic,
     List<String> hyperfocusTags = const [],
+    String postType = 'post',
   }) async {
     final uid = currentUserId;
     if (uid == null) return null;
@@ -293,6 +463,7 @@ class SupabaseService {
             if (imageSemantic != null && imageSemantic.isNotEmpty)
               'image_semantic': imageSemantic,
             'hyperfocus_tags': hyperfocusTags,
+            'post_type': postType,
           })
           .select()
           .single();
@@ -412,6 +583,67 @@ class SupabaseService {
     } catch (e) {
       debugPrint('deletePost error: $e');
       return false;
+    }
+  }
+
+  Future<bool> updatePost(
+    String postId, {
+    required String content,
+    required String visibility,
+    String? imageUrl,
+  }) async {
+    final uid = currentUserId;
+    if (uid == null) return false;
+    try {
+      final Map<String, dynamic> updates = {
+        'content': content,
+        'visibility': visibility,
+      };
+      if (imageUrl != null) updates['image_url'] = imageUrl;
+      await client
+          .from('posts')
+          .update(updates)
+          .eq('id', postId)
+          .eq('author_id', uid);
+
+      // Insert a post_edit notification so the author sees the edit in their notification center
+      try {
+        final profile = await client
+            .from('user_profiles')
+            .select('full_name, username')
+            .eq('id', uid)
+            .maybeSingle();
+        final actorName = (profile?['full_name'] as String?)?.isNotEmpty == true
+            ? profile!['full_name'] as String
+            : (profile?['username'] as String? ?? 'Você');
+        await client.from('notifications').insert({
+          'recipient_id': uid,
+          'actor_id': uid,
+          'type': 'post_edit',
+          'title': 'Publicação editada',
+          'body': '$actorName editou uma publicação.',
+          'reference_id': postId,
+          'is_read': false,
+        });
+      } catch (notifErr) {
+        debugPrint('updatePost notification error (non-fatal): $notifErr');
+      }
+
+      return true;
+    } catch (e) {
+      debugPrint('updatePost error: $e');
+      // Fallback: try updating only content if visibility column doesn't exist yet
+      try {
+        await client
+            .from('posts')
+            .update({'content': content})
+            .eq('id', postId)
+            .eq('author_id', uid);
+        return true;
+      } catch (e2) {
+        debugPrint('updatePost fallback error: $e2');
+        return false;
+      }
     }
   }
 
@@ -546,6 +778,26 @@ class SupabaseService {
       };
     } catch (e) {
       debugPrint('fetchLikedPostIds error: $e');
+      return {};
+    }
+  }
+
+  /// Fetch saved post IDs for the current user from a given list of post IDs.
+  Future<Set<String>> fetchSavedPostIds(List<String> postIds) async {
+    final uid = currentUserId;
+    if (uid == null || postIds.isEmpty) return {};
+    try {
+      final data = await client
+          .from('saved_posts')
+          .select('post_id')
+          .eq('user_id', uid)
+          .inFilter('post_id', postIds);
+      return {
+        for (final row in List<Map<String, dynamic>>.from(data))
+          row['post_id'] as String,
+      };
+    } catch (e) {
+      debugPrint('fetchSavedPostIds error: $e');
       return {};
     }
   }
@@ -1052,11 +1304,26 @@ class SupabaseService {
           .toList();
 
       // Step 3: Batch-fetch all OTHER participants for these conversations
-      final otherParticipants = await client
-          .from('conversation_participants')
-          .select('conversation_id, user_id')
-          .inFilter('conversation_id', convIds)
-          .neq('user_id', uid);
+      // Use SECURITY DEFINER RPC to bypass RLS and always get co-participants
+      List<Map<String, dynamic>> otherParticipants = [];
+      try {
+        final rpcResult = await client.rpc(
+          'get_conversation_participants',
+          params: {'conv_ids': convIds},
+        );
+        otherParticipants = (rpcResult as List)
+            .map((r) => Map<String, dynamic>.from(r as Map))
+            .toList();
+      } catch (_) {
+        // Fallback to direct query if RPC not available
+        try {
+          otherParticipants = await client
+              .from('conversation_participants')
+              .select('conversation_id, user_id')
+              .inFilter('conversation_id', convIds)
+              .neq('user_id', uid);
+        } catch (_) {}
+      }
 
       // Step 4: Collect unique other user IDs
       final otherUserIds = otherParticipants
@@ -1085,6 +1352,61 @@ class SupabaseService {
         final userId = op['user_id'] as String?;
         if (convId != null && userId != null) {
           convToOtherUser[convId] = userId;
+        }
+      }
+
+      // Step 6b: For conversations where RLS blocked reading other participants,
+      // fall back to finding the other user from the messages table
+      final missingConvIds = convIds.where((id) {
+        final conv = participantRows.firstWhere(
+          (r) => r['conversation_id'] == id,
+          orElse: () => {},
+        );
+        final convData = conv['conversation'] as Map<String, dynamic>? ?? {};
+        final isGroup = convData['is_group'] as bool? ?? false;
+        return !isGroup && !convToOtherUser.containsKey(id);
+      }).toList();
+
+      if (missingConvIds.isNotEmpty) {
+        try {
+          // Find the other sender in messages for these conversations
+          final msgRows = await client
+              .from('messages')
+              .select('conversation_id, sender_id')
+              .inFilter('conversation_id', missingConvIds)
+              .neq('sender_id', uid)
+              .limit(missingConvIds.length * 2);
+
+          for (final msg in msgRows) {
+            final convId = msg['conversation_id'] as String?;
+            final senderId = msg['sender_id'] as String?;
+            if (convId != null &&
+                senderId != null &&
+                !convToOtherUser.containsKey(convId)) {
+              convToOtherUser[convId] = senderId;
+              if (!otherUserIds.contains(senderId)) {
+                otherUserIds.add(senderId);
+              }
+            }
+          }
+
+          // Fetch profiles for newly discovered user IDs
+          final newIds = convToOtherUser.values
+              .where((id) => !profilesById.containsKey(id))
+              .toSet()
+              .toList();
+          if (newIds.isNotEmpty) {
+            final newProfiles = await client
+                .from('user_profiles')
+                .select('id, full_name, username, avatar_url')
+                .inFilter('id', newIds);
+            for (final p in newProfiles) {
+              final id = p['id'] as String?;
+              if (id != null) profilesById[id] = Map<String, dynamic>.from(p);
+            }
+          }
+        } catch (e) {
+          debugPrint('fetchConversations fallback error: $e');
         }
       }
 
@@ -1125,8 +1447,14 @@ class SupabaseService {
             }
           }
         } else if (isGroup) {
-          otherName = conv['name'] as String? ?? 'Grupo';
-          otherAvatarUrl = conv['avatar_url'] as String? ?? '';
+          otherName =
+              conv['group_name'] as String? ??
+              conv['name'] as String? ??
+              'Grupo';
+          otherAvatarUrl =
+              conv['group_image_url'] as String? ??
+              conv['avatar_url'] as String? ??
+              '';
         }
 
         enriched.add({
@@ -1413,10 +1741,10 @@ class SupabaseService {
             'creator_id': uid,
             'name': name.trim(),
             'description': description.trim(),
-            'tags': tags,
+            'hyperfocus_tags': tags,
             'is_public': isPublic,
             if (avatarUrl != null && avatarUrl.isNotEmpty)
-              'avatar_url': avatarUrl,
+              'cover_url': avatarUrl,
             'members_count': 1,
           })
           .select('id')
@@ -1457,6 +1785,24 @@ class SupabaseService {
   // USER DIARY
   // ─────────────────────────────────────────────────────────────
 
+  Future<List<Map<String, dynamic>>> fetchUserPublicDiaryEntries(
+    String targetUserId,
+  ) async {
+    try {
+      final uid = currentUserId;
+      final data = await client
+          .from('user_diary_entries')
+          .select()
+          .eq('user_id', targetUserId)
+          .order('created_at', ascending: false);
+      // RLS handles filtering: owner sees all, friends see friends_only, public sees is_private=false
+      return List<Map<String, dynamic>>.from(data);
+    } catch (e) {
+      debugPrint('fetchUserPublicDiaryEntries error: $e');
+      return [];
+    }
+  }
+
   Future<List<Map<String, dynamic>>> fetchDiaryEntries() async {
     final uid = currentUserId;
     if (uid == null) return [];
@@ -1479,6 +1825,7 @@ class SupabaseService {
     String mood = '',
     List<String> tags = const [],
     bool isPrivate = true,
+    bool friendsOnly = true,
   }) async {
     final uid = currentUserId;
     if (uid == null) return null;
@@ -1498,6 +1845,7 @@ class SupabaseService {
             'mood': mood,
             'tags': tags,
             'is_private': isPrivate,
+            'friends_only': friendsOnly,
           })
           .select()
           .single();
@@ -1505,6 +1853,26 @@ class SupabaseService {
     } catch (e) {
       debugPrint('addDiaryEntry error: $e');
       return null;
+    }
+  }
+
+  Future<bool> updateDiaryEntryVisibility({
+    required String entryId,
+    required bool isPrivate,
+    required bool friendsOnly,
+  }) async {
+    final uid = currentUserId;
+    if (uid == null) return false;
+    try {
+      await client
+          .from('user_diary_entries')
+          .update({'is_private': isPrivate, 'friends_only': friendsOnly})
+          .eq('id', entryId)
+          .eq('user_id', uid);
+      return true;
+    } catch (e) {
+      debugPrint('updateDiaryEntryVisibility error: $e');
+      return false;
     }
   }
 
@@ -1792,43 +2160,105 @@ class SupabaseService {
   // ─────────────────────────────────────────────────────────────────────────
 
   /// Submit a content report to the reports table.
+  /// Supports post reports (reported_post_id) and user reports (reported_user_id).
+  /// After inserting the report, sends an in-app notification to the post author
+  /// (the DB trigger also handles this, but we do it here as belt-and-suspenders).
   Future<void> submitReport({
     String? reportedUserId,
     required String contentType,
     String? contentId,
     required String reason,
     String? details,
+    String? postAuthorId,
   }) async {
     final uid = currentUserId;
     if (uid == null) return;
+
+    // Map reason string to report_reason enum value
+    final reasonEnum = _mapReasonToEnum(reason);
+
     try {
-      await client.from('reports').insert({
+      final Map<String, dynamic> payload = {
         'reporter_id': uid,
-        if (reportedUserId != null) 'reported_user_id': reportedUserId,
-        'content_type': contentType,
-        if (contentId != null) 'content_id': contentId,
-        'reason': reason,
-        if (details != null && details.isNotEmpty) 'details': details,
         'status': 'pending',
-      });
+        'reason': reasonEnum,
+        if (details != null && details.isNotEmpty) 'description': details,
+        'deadline_at': DateTime.now()
+            .add(const Duration(hours: 24))
+            .toIso8601String(),
+      };
+
+      if (contentType == 'post' && contentId != null) {
+        payload['reported_post_id'] = contentId;
+        if (reportedUserId != null) {
+          payload['reported_user_id'] = reportedUserId;
+        }
+      } else if (contentType == 'comment' && contentId != null) {
+        payload['reported_comment_id'] = contentId;
+        if (reportedUserId != null) {
+          payload['reported_user_id'] = reportedUserId;
+        }
+      } else if (contentType == 'profile' && reportedUserId != null) {
+        payload['reported_user_id'] = reportedUserId;
+      }
+
+      await client.from('reports').insert(payload);
+
+      // Belt-and-suspenders: also send notification directly if we have the author id
+      // (DB trigger trg_notify_author_on_report handles this automatically too)
+      if (contentType == 'post' && contentId != null) {
+        final authorId = postAuthorId ?? await _fetchPostAuthorId(contentId);
+        if (authorId != null && authorId != uid) {
+          try {
+            await client.from('notifications').insert({
+              'recipient_id': authorId,
+              'actor_id': uid,
+              'type': 'report',
+              'title': '⚠️ Sua publicação foi denunciada',
+              'body':
+                  'Uma denúncia foi registrada em sua publicação. Você tem 24 horas para editar ou remover o conteúdo. Caso contrário, ele será removido automaticamente.',
+              'reference_id': contentId,
+              'is_read': false,
+            });
+          } catch (notifError) {
+            debugPrint('submitReport notification error: $notifError');
+          }
+        }
+      }
     } catch (e) {
       debugPrint('submitReport error: $e');
       rethrow;
     }
   }
 
-  /// Block a user immediately.
-  Future<void> blockUser(String blockedUserId) async {
-    final uid = currentUserId;
-    if (uid == null) return;
+  /// Maps human-readable reason strings to report_reason enum values.
+  String _mapReasonToEnum(String reason) {
+    switch (reason.toLowerCase()) {
+      case 'discurso de ódio ou discriminação':
+        return 'hate_speech';
+      case 'assédio, bullying ou ameaças':
+        return 'harassment';
+      case 'conteúdo explícito ou sexualmente inadequado':
+        return 'inappropriate_content';
+      case 'spam, fraude ou perfil falso':
+        return 'spam';
+      default:
+        return 'other';
+    }
+  }
+
+  /// Fetches the author_id of a post by its ID.
+  Future<String?> _fetchPostAuthorId(String postId) async {
     try {
-      await client.from('blocked_users').upsert({
-        'blocker_id': uid,
-        'blocked_user_id': blockedUserId,
-      }, onConflict: 'blocker_id,blocked_user_id');
+      final data = await client
+          .from('posts')
+          .select('author_id')
+          .eq('id', postId)
+          .maybeSingle();
+      return data?['author_id'] as String?;
     } catch (e) {
-      debugPrint('blockUser error: $e');
-      rethrow;
+      debugPrint('_fetchPostAuthorId error: $e');
+      return null;
     }
   }
 
@@ -1836,21 +2266,69 @@ class SupabaseService {
   // SINTONIA AI
   // ─────────────────────────────────────────────────────────────────────────
 
-  /// Calls the Supabase Edge Function `sintonia-ai` to get an AI response.
+  /// Calls the AI chat completion Lambda to get a SintonIA AI response.
   /// Returns the AI reply text, or null if the call fails.
   Future<String?> callSintoniaAI(String userMessage) async {
     try {
-      final response = await client.functions.invoke(
-        'sintonia-ai',
-        body: {'message': userMessage},
+      final response = await getChatCompletion(
+        'GEMINI',
+        'gemini/gemini-3.7-flash',
+        [
+          {
+            'role': 'system',
+            'content':
+                'Você é SintonIA, uma IA empática e acolhedora especializada em apoiar pessoas neurodivergentes. '
+                'Responda sempre em português brasileiro, com empatia, clareza e sem julgamentos.',
+          },
+          {'role': 'user', 'content': userMessage},
+        ],
+        parameters: {'max_tokens': 500},
       );
-      final data = response.data;
-      if (data is Map && data['reply'] != null) {
-        return data['reply'] as String?;
-      }
-      return null;
+      return response['choices']?[0]?['message']?['content'] as String?;
     } catch (e) {
       debugPrint('callSintoniaAI error: $e');
+      return null;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // LGPD — Consent Logging & Data Export (Art. 7, 8, 18)
+  // ─────────────────────────────────────────────────────────────
+
+  /// Logs a consent event to the consent_logs table.
+  /// [consentType] — 'terms', 'privacy_policy', 'sensitive_data', etc.
+  /// [accepted] — true = accepted, false = revoked.
+  Future<void> logConsent({
+    required String consentType,
+    bool accepted = true,
+    String? ipAddress,
+    String? userAgent,
+  }) async {
+    final uid = currentUserId;
+    if (uid == null) return;
+    try {
+      await client.from('consent_logs').insert({
+        'user_id': uid,
+        'consent_type': consentType,
+        'accepted': accepted,
+        if (ipAddress != null) 'ip_address': ipAddress,
+        if (userAgent != null) 'user_agent': userAgent,
+        'accepted_at': DateTime.now().toIso8601String(),
+      });
+    } catch (e) {
+      debugPrint('logConsent error: $e');
+    }
+  }
+
+  /// Exports all personal data for the current user (LGPD Art. 18).
+  /// Returns a JSON map with profile, posts, friendships, notifications, etc.
+  Future<Map<String, dynamic>?> exportUserData() async {
+    try {
+      final result = await client.rpc('export_user_data');
+      if (result == null) return null;
+      return Map<String, dynamic>.from(result as Map);
+    } catch (e) {
+      debugPrint('exportUserData error: $e');
       return null;
     }
   }
@@ -1890,11 +2368,7 @@ class SupabaseService {
 
     // 2. Try Gemini via Lambda for AI-powered score
     try {
-      final lambdaUrl = const String.fromEnvironment(
-        'AWS_LAMBDA_CHAT_COMPLETION_URL',
-        defaultValue: '',
-      );
-      if (lambdaUrl.isNotEmpty && userA != null && userB != null) {
+      if (userA != null && userB != null) {
         final neuroA = userA['neurodiv_type'] ?? 'não informado';
         final neuroB = userB['neurodiv_type'] ?? 'não informado';
         final hyperfocusA = (userA['hyperfocuses'] as List?)?.join(', ') ?? '';
@@ -1909,28 +2383,20 @@ class SupabaseService {
             'Usuário 2: Tipo neurodivergente: $neuroB, Hiperfocos: $hyperfocusB, Interesses: $interestsB\n'
             'Responda SOMENTE com o número, sem texto adicional.';
 
-        final dio = client.rest.headers; // just to confirm client is alive
-
-        // Use the existing Lambda chat completion endpoint
-        final response = await client.functions.invoke(
-          'chat-completion',
-          body: {
-            'provider': 'gemini',
-            'model': 'gemini-1.5-flash',
-            'messages': [
-              {'role': 'user', 'content': prompt},
-            ],
-            'stream': false,
-            'parameters': {'max_tokens': 10},
-          },
+        final response = await getChatCompletion(
+          'GEMINI',
+          'gemini/gemini-3.7-flash',
+          [
+            {'role': 'user', 'content': prompt},
+          ],
+          parameters: {'max_tokens': 10},
         );
-        final data = response.data;
-        if (data != null) {
-          final text =
-              (data['content'] as String?) ?? (data['text'] as String?) ?? '';
-          final cleaned = text.replaceAll(RegExp(r'[^0-9]'), '');
-          score = int.tryParse(cleaned) ?? 50;
-          score = score.clamp(0, 100);
+        final text =
+            response['choices']?[0]?['message']?['content'] as String? ?? '';
+        final cleaned = text.replaceAll(RegExp(r'[^0-9]'), '');
+        final parsed = int.tryParse(cleaned);
+        if (parsed != null) {
+          score = parsed.clamp(0, 100);
         }
       }
     } catch (e) {

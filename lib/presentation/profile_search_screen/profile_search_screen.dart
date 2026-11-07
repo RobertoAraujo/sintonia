@@ -1,13 +1,14 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:sizer/sizer.dart';
 
 import '../../models/user_profile.dart';
 import '../../models/profile_match_result.dart';
+import '../../repositories/supabase_recommendation_repository.dart';
 import '../../services/recommendation_engine_service.dart';
 import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
-import '../../widgets/custom_image_widget.dart';
 import '../user_profile_screen/user_profile_screen.dart';
 
 /// Screen that allows searching for user profiles and viewing compatibility.
@@ -26,80 +27,273 @@ class _ProfileSearchScreenState extends State<ProfileSearchScreen> {
   final FocusNode _searchFocus = FocusNode();
   final RecommendationEngineService _engine =
       const RecommendationEngineService();
+  final SupabaseRecommendationRepository _repo =
+      const SupabaseRecommendationRepository();
 
-  List<Map<String, dynamic>> _allProfiles = [];
-  List<Map<String, dynamic>> _filteredProfiles = [];
-  bool _isLoading = false;
+  // Suggestions (affinity-sorted, shown when query is empty)
+  List<ProfileMatchResult> _suggestions = [];
+  bool _loadingSuggestions = false;
+  bool _suggestionsLoaded = false;
+
+  // Search results
+  List<ProfileMatchResult> _searchResults = [];
+  bool _isSearching = false;
   String _query = '';
+
+  Timer? _debounce;
 
   @override
   void initState() {
     super.initState();
     _searchController.addListener(_onQueryChanged);
+    _loadSuggestions();
   }
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _searchController.dispose();
     _searchFocus.dispose();
     super.dispose();
   }
 
-  Future<void> _searchProfiles(String q) async {
-    if (q.trim().isEmpty) {
+  // ── Load affinity-sorted suggestions ──────────────────────────────────────
+
+  Future<void> _loadSuggestions() async {
+    if (_suggestionsLoaded) return;
+    setState(() => _loadingSuggestions = true);
+    try {
+      final results = await _repo.fetchRecommendations(
+        currentUser: widget.currentUserProfile,
+        limit: 30,
+      );
+      if (!mounted) return;
       setState(() {
-        _filteredProfiles = [];
-        _isLoading = false;
+        _suggestions = results;
+        _loadingSuggestions = false;
+        _suggestionsLoaded = true;
+      });
+    } catch (e) {
+      if (mounted) setState(() => _loadingSuggestions = false);
+    }
+  }
+
+  // ── Search by name or interest ─────────────────────────────────────────────
+
+  void _onQueryChanged() {
+    final q = _searchController.text.trim();
+    if (q == _query) return;
+    setState(() => _query = q);
+
+    _debounce?.cancel();
+    if (q.isEmpty) {
+      setState(() {
+        _searchResults = [];
+        _isSearching = false;
       });
       return;
     }
-    setState(() => _isLoading = true);
+
+    _debounce = Timer(const Duration(milliseconds: 350), () => _runSearch(q));
+  }
+
+  Future<void> _runSearch(String q) async {
+    if (q.trim().isEmpty) return;
+    setState(() => _isSearching = true);
     try {
-      final results = await SupabaseService.instance.searchUsers(q.trim());
-      if (!mounted) return;
       final uid = SupabaseService.instance.currentUserId;
-      final filtered = results.where((u) => u['id'] != uid).toList();
-      setState(() {
-        _allProfiles = filtered;
-        _filteredProfiles = filtered;
-        _isLoading = false;
+      final qLower = q.trim().toLowerCase();
+
+      // Fetch from DB: search by name, username, or hyperfocus/interest
+      final byName = await SupabaseService.instance.searchUsers(q.trim());
+
+      // Also search by hyperfocus/interest via a separate query
+      List<Map<String, dynamic>> byInterest = [];
+      try {
+        final data = await SupabaseService.instance.client
+            .from('user_profiles')
+            .select(
+              'id, full_name, username, avatar_url, bio, neurodiv_type, '
+              'hyperfocuses, interests, communication_styles, values_and_ideas, '
+              'communication_preferences',
+            )
+            .or('hyperfocuses.cs.{"$q"},interests.cs.{"$q"}')
+            .neq('id', uid ?? '')
+            .limit(20);
+        byInterest = List<Map<String, dynamic>>.from(data);
+      } catch (_) {
+        // Fallback: filter from suggestions by interest match
+        byInterest = [];
+      }
+
+      // Merge and deduplicate
+      final seen = <String>{};
+      final merged = <Map<String, dynamic>>[];
+      for (final p in [...byName, ...byInterest]) {
+        final id = p['id'] as String? ?? '';
+        if (id.isNotEmpty && id != uid && seen.add(id)) {
+          merged.add(p);
+        }
+      }
+
+      // Convert to UserProfile and score against current user
+      final candidates = merged
+          .map((row) => _mapRowToUserProfile(row))
+          .toList();
+      final scored = _engine.getRecommendedProfiles(
+        currentUser: widget.currentUserProfile,
+        candidateProfiles: candidates,
+        limit: 50,
+      );
+
+      // Attach raw DB data for display (username, neurodiv_type, etc.)
+      final rawById = {for (final r in merged) r['id'] as String: r};
+      final enriched = scored.map((result) {
+        final raw = rawById[result.profile.id];
+        if (raw == null) return result;
+        return _ProfileMatchResultWithRaw(result: result, raw: raw);
+      }).toList();
+
+      // Also include name/username matches that scored 0 (still relevant)
+      // Sort: first by score desc, then alphabetically
+      enriched.sort((a, b) {
+        final aScore = a is _ProfileMatchResultWithRaw
+            ? a.matchScore
+            : (a).matchScore;
+        final bScore = b is _ProfileMatchResultWithRaw
+            ? b.matchScore
+            : (b).matchScore;
+        return bScore.compareTo(aScore);
       });
-    } catch (_) {
-      if (mounted) setState(() => _isLoading = false);
+
+      if (!mounted) return;
+      setState(() {
+        _searchResults = enriched.cast<ProfileMatchResult>();
+        _isSearching = false;
+      });
+    } catch (e) {
+      if (mounted) setState(() => _isSearching = false);
     }
   }
 
-  void _onQueryChanged() {
-    final q = _searchController.text.trim().toLowerCase();
-    if (q == _query) return;
-    setState(() => _query = q);
-    _searchProfiles(q);
+  UserProfile _mapRowToUserProfile(Map<String, dynamic> row) {
+    // ── Neurotypes ──────────────────────────────────────────────────────────
+    List<Neurotype> neurotypes = [];
+    final ntRaw = row['neurodiv_type'];
+    final ntList = ntRaw is List
+        ? ntRaw.map((e) => e.toString().toLowerCase().trim()).toList()
+        : [((ntRaw as String?) ?? '').toLowerCase().trim()];
+
+    const ntMap = {
+      'tdah': Neurotype.adhd,
+      'adhd': Neurotype.adhd,
+      'tea': Neurotype.asd,
+      'asd': Neurotype.asd,
+      'autismo': Neurotype.asd,
+      'dislexia': Neurotype.dyslexia,
+      'dyslexia': Neurotype.dyslexia,
+      'superdotacao': Neurotype.giftedHighAbility,
+      'superdotação': Neurotype.giftedHighAbility,
+      'gifted': Neurotype.giftedHighAbility,
+      'discalculia': Neurotype.dyscalculia,
+      'dyscalculia': Neurotype.dyscalculia,
+      'tourette': Neurotype.tourette,
+      'toc': Neurotype.anxiety,
+      'anxiety': Neurotype.anxiety,
+      'ansiedade': Neurotype.anxiety,
+      'depressao': Neurotype.depression,
+      'depressão': Neurotype.depression,
+      'depression': Neurotype.depression,
+      'bipolar': Neurotype.bipolar,
+      'neurotipico': Neurotype.neurotypical,
+      'neurotípico': Neurotype.neurotypical,
+      'neurotypical': Neurotype.neurotypical,
+      'outro': Neurotype.neurotypical,
+      'other': Neurotype.neurotypical,
+    };
+
+    for (final nt in ntList) {
+      if (nt.isNotEmpty && ntMap.containsKey(nt)) {
+        neurotypes.add(ntMap[nt]!);
+      }
+    }
+
+    // ── Helper to parse string lists from DB ────────────────────────────────
+    List<String> parseList(String key) {
+      final raw = row[key];
+      if (raw is List) return raw.map((e) => e.toString()).toList();
+      if (raw is String && raw.isNotEmpty) return [raw];
+      return [];
+    }
+
+    // ── Communication styles ────────────────────────────────────────────────
+    // DB stores communication_styles and communication_preferences as text arrays
+    const commStyleMap = {
+      'texto_curto': CommunicationStyle.shortText,
+      'short_text': CommunicationStyle.shortText,
+      'texto_longo': CommunicationStyle.longText,
+      'long_text': CommunicationStyle.longText,
+      'audio': CommunicationStyle.audio,
+      'video': CommunicationStyle.video,
+      'mensagens_diretas': CommunicationStyle.directMessages,
+      'direct_messages': CommunicationStyle.directMessages,
+      'mensagens_assincronas': CommunicationStyle.asyncMessages,
+      'async_messages': CommunicationStyle.asyncMessages,
+      'emojis': CommunicationStyle.emojiHeavy,
+      'emoji_heavy': CommunicationStyle.emojiHeavy,
+      'formal': CommunicationStyle.formalTone,
+      'formal_tone': CommunicationStyle.formalTone,
+      'informal': CommunicationStyle.informalTone,
+      'informal_tone': CommunicationStyle.informalTone,
+    };
+
+    final rawCommStyles = [
+      ...parseList('communication_styles'),
+      ...parseList('communication_preferences'),
+    ];
+    final communicationStyles = rawCommStyles
+        .map((s) => commStyleMap[s.toLowerCase().trim()])
+        .whereType<CommunicationStyle>()
+        .toSet()
+        .toList();
+
+    // ── Hyperfocus + interests ──────────────────────────────────────────────
+    final hyperfocusInterests =
+        parseList('hyperfocuses') + parseList('interests');
+
+    // ── Values and ideas ────────────────────────────────────────────────────
+    final valuesAndIdeas = parseList('values_and_ideas');
+
+    return UserProfile(
+      id: row['id'] as String? ?? '',
+      displayName: row['full_name'] as String? ?? 'Usuário',
+      avatarUrl: row['avatar_url'] as String?,
+      bio: row['bio'] as String?,
+      neurotypes: neurotypes,
+      hyperfocusInterests: hyperfocusInterests,
+      communicationStyles: communicationStyles,
+      valuesAndIdeas: valuesAndIdeas,
+    );
   }
 
-  void _openProfile(Map<String, dynamic> profile) {
+  void _openProfile(Map<String, dynamic> raw) {
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => UserProfileScreen(
           userData: {
-            'id': profile['id'] ?? '',
-            'name': profile['full_name'] ?? 'Usuário',
-            'username': '@${profile['username'] ?? ''}',
-            'avatarUrl': profile['avatar_url'] ?? '',
-            'avatarSemantic':
-                '${profile['full_name'] ?? 'Usuário'} foto de perfil',
-            'bio': profile['bio'] ?? '',
-            'neurodivType': profile['neurodiv_type'] ?? '',
+            'id': raw['id'] ?? '',
+            'name': raw['full_name'] ?? 'Usuário',
+            'username': '@${raw['username'] ?? ''}',
+            'avatarUrl': raw['avatar_url'] ?? '',
+            'avatarSemantic': '${raw['full_name'] ?? 'Usuário'} foto de perfil',
+            'bio': raw['bio'] ?? '',
+            'neurodivType': raw['neurodiv_type'] ?? '',
             'hyperfocuses':
-                (profile['hyperfocuses'] as List?)
-                    ?.map(
-                      (h) => {
-                        'name': h['name'] ?? '',
-                        'color': h['color'] ?? 0xFF4A90D9,
-                      },
-                    )
+                (raw['hyperfocuses'] as List?)
+                    ?.map((h) => {'name': h.toString(), 'color': 0xFF4A90D9})
                     .toList() ??
                 [],
-            'interests': (profile['interests'] as List?)?.cast<String>() ?? [],
+            'interests': (raw['interests'] as List?)?.cast<String>() ?? [],
             'friendsCount': 0,
             'postsCount': 0,
             'compatScore': 0,
@@ -117,6 +311,9 @@ class _ProfileSearchScreenState extends State<ProfileSearchScreen> {
     const floatingNavHeight = 80.0;
     final listBottomPadding = floatingNavHeight + bottomPadding + 16.0;
 
+    final bool showSearch = _query.isNotEmpty;
+    final bool showSuggestions = _query.isEmpty;
+
     return Scaffold(
       backgroundColor: theme.scaffoldBackgroundColor,
       appBar: AppBar(
@@ -131,13 +328,13 @@ class _ProfileSearchScreenState extends State<ProfileSearchScreen> {
       ),
       body: Column(
         children: [
-          // Search bar
+          // ── Search bar ──────────────────────────────────────────────────
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
             child: TextField(
               controller: _searchController,
               focusNode: _searchFocus,
-              autofocus: true,
+              autofocus: false,
               decoration: InputDecoration(
                 hintText: 'Buscar por nome, interesse...',
                 hintStyle: theme.textTheme.bodyMedium?.copyWith(
@@ -153,7 +350,7 @@ class _ProfileSearchScreenState extends State<ProfileSearchScreen> {
                         icon: const Icon(Icons.close_rounded, size: 20),
                         onPressed: () {
                           _searchController.clear();
-                          _searchFocus.requestFocus();
+                          _searchFocus.unfocus();
                         },
                       )
                     : null,
@@ -170,34 +367,139 @@ class _ProfileSearchScreenState extends State<ProfileSearchScreen> {
               ),
             ),
           ),
-          // Results
+
+          // ── Content ─────────────────────────────────────────────────────
           Expanded(
-            child: _isLoading
-                ? const Center(
-                    child: CircularProgressIndicator(color: AppTheme.primary),
-                  )
-                : _filteredProfiles.isEmpty
-                ? _buildEmpty(theme)
-                : ListView.separated(
-                    padding: EdgeInsets.fromLTRB(16, 8, 16, listBottomPadding),
-                    itemCount: _filteredProfiles.length,
-                    separatorBuilder: (_, __) =>
-                        const Divider(height: 1, indent: 60),
-                    itemBuilder: (context, index) {
-                      final profile = _filteredProfiles[index];
-                      return _SupabaseProfileTile(
-                        profile: profile,
-                        onTap: () => _openProfile(profile),
-                      );
-                    },
-                  ),
+            child: showSearch
+                ? _buildSearchResults(theme, listBottomPadding)
+                : _buildSuggestions(theme, listBottomPadding),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildEmpty(ThemeData theme) {
+  // ── Search results view ──────────────────────────────────────────────────
+
+  Widget _buildSearchResults(ThemeData theme, double bottomPadding) {
+    if (_isSearching) {
+      return const Center(
+        child: CircularProgressIndicator(color: AppTheme.primary),
+      );
+    }
+    if (_searchResults.isEmpty) {
+      return _buildEmptySearch(theme);
+    }
+    return ListView.separated(
+      padding: EdgeInsets.fromLTRB(16, 4, 16, bottomPadding),
+      itemCount: _searchResults.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 8),
+      itemBuilder: (context, index) {
+        final result = _searchResults[index];
+        final raw = result is _ProfileMatchResultWithRaw
+            ? result.raw
+            : _profileToRaw(result.profile);
+        return _AffinityProfileCard(
+          result: result is _ProfileMatchResultWithRaw ? result : result,
+          raw: raw,
+          currentUser: widget.currentUserProfile,
+          onTap: () => _openProfile(raw),
+          highlightQuery: _query,
+        );
+      },
+    );
+  }
+
+  // ── Suggestions view ─────────────────────────────────────────────────────
+
+  Widget _buildSuggestions(ThemeData theme, double bottomPadding) {
+    if (_loadingSuggestions) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(color: AppTheme.primary),
+            const SizedBox(height: 12),
+            Text(
+              'Calculando afinidades...',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_suggestions.isEmpty) {
+      return _buildEmptyState(theme);
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          child: Row(
+            children: [
+              Icon(
+                Icons.auto_awesome_rounded,
+                size: 16,
+                color: AppTheme.primary,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                'Sugestões por Afinidade',
+                style: GoogleFonts.inter(
+                  fontSize: 12.sp,
+                  fontWeight: FontWeight.w600,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                '${_suggestions.length} perfis',
+                style: GoogleFonts.inter(
+                  fontSize: 10.sp,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView.separated(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, bottomPadding),
+            itemCount: _suggestions.length,
+            separatorBuilder: (_, __) => const SizedBox(height: 8),
+            itemBuilder: (context, index) {
+              final result = _suggestions[index];
+              final raw = _profileToRaw(result.profile);
+              return _AffinityProfileCard(
+                result: result,
+                raw: raw,
+                currentUser: widget.currentUserProfile,
+                onTap: () => _openProfile(raw),
+                rank: index + 1,
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Map<String, dynamic> _profileToRaw(UserProfile p) => {
+    'id': p.id,
+    'full_name': p.displayName,
+    'avatar_url': p.avatarUrl ?? '',
+    'bio': p.bio ?? '',
+    'neurodiv_type': p.neurotypes.isNotEmpty ? p.neurotypes.first.name : '',
+    'hyperfocuses': p.hyperfocusInterests,
+    'interests': <String>[],
+  };
+
+  Widget _buildEmptySearch(ThemeData theme) {
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -209,9 +511,7 @@ class _ProfileSearchScreenState extends State<ProfileSearchScreen> {
           ),
           const SizedBox(height: 12),
           Text(
-            _query.isEmpty
-                ? 'Digite para buscar perfis'
-                : 'Nenhum perfil encontrado para "$_query"',
+            'Nenhum perfil encontrado para "$_query"',
             style: theme.textTheme.bodyMedium?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),
@@ -221,493 +521,86 @@ class _ProfileSearchScreenState extends State<ProfileSearchScreen> {
       ),
     );
   }
-}
 
-class _SupabaseProfileTile extends StatelessWidget {
-  final Map<String, dynamic> profile;
-  final VoidCallback onTap;
-
-  const _SupabaseProfileTile({required this.profile, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final name = profile['full_name'] as String? ?? 'Usuário';
-    final username = profile['username'] as String? ?? '';
-    final avatarUrl = profile['avatar_url'] as String? ?? '';
-    final bio = profile['bio'] as String? ?? '';
-    final neurodivType = profile['neurodiv_type'] as String? ?? '';
-
-    return ListTile(
-      contentPadding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
-      leading: CircleAvatar(
-        radius: 24,
-        backgroundColor: AppTheme.primaryContainer,
-        backgroundImage: avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
-        child: avatarUrl.isEmpty
-            ? Text(
-                name.isNotEmpty ? name[0].toUpperCase() : '?',
-                style: const TextStyle(
-                  color: AppTheme.primary,
-                  fontWeight: FontWeight.w700,
-                ),
-              )
-            : null,
-      ),
-      title: Text(
-        name,
-        style: theme.textTheme.titleSmall,
-        overflow: TextOverflow.ellipsis,
-      ),
-      subtitle: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (username.isNotEmpty)
-            Text(
-              '@$username',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: AppTheme.primary,
-              ),
-            ),
-          if (bio.isNotEmpty)
-            Text(
-              bio,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-        ],
-      ),
-      trailing: neurodivType.isNotEmpty
-          ? Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: AppTheme.primary.withAlpha(20),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                neurodivType,
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: AppTheme.primary,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            )
-          : null,
-      onTap: onTap,
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Profile detail page with full compatibility breakdown
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _ProfileDetailSheet extends StatelessWidget {
-  final ProfileMatchResult result;
-  final UserProfile currentUser;
-  final RecommendationEngineService engine;
-
-  const _ProfileDetailSheet({
-    required this.result,
-    required this.currentUser,
-    required this.engine,
-  });
-
-  Color _compatColor(int pct) {
-    if (pct >= 75) return AppTheme.success;
-    if (pct >= 50) return AppTheme.warning;
-    return AppTheme.error;
-  }
-
-  String _compatLabel(int pct) {
-    if (pct >= 85) return 'Altíssima Sintonia ✨';
-    if (pct >= 70) return 'Boa Compatibilidade 💚';
-    if (pct >= 50) return 'Compatibilidade Moderada 🌱';
-    return 'Baixa Compatibilidade';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final profile = result.profile;
-    final pct = result.matchPercentage;
-    final color = _compatColor(pct);
-
-    // Recalculate full breakdown
-    final fullResult = _buildFullResult();
-
-    return Scaffold(
-      backgroundColor: theme.colorScheme.surface,
-      appBar: AppBar(
-        backgroundColor: theme.colorScheme.surface,
-        elevation: 0,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new_rounded),
-          onPressed: () => Navigator.of(context).pop(),
-        ),
-        title: Text(
-          profile.displayName,
-          style: GoogleFonts.inter(
-            fontWeight: FontWeight.w600,
-            fontSize: 15.sp,
-          ),
-          overflow: TextOverflow.ellipsis,
-        ),
-        centerTitle: true,
-      ),
-      body: SingleChildScrollView(
-        padding: EdgeInsets.symmetric(horizontal: 5.w, vertical: 2.h),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            // Avatar
-            CircleAvatar(
-              radius: 44,
-              backgroundColor: AppTheme.primaryContainer,
-              child: ClipOval(
-                child: profile.avatarUrl != null
-                    ? CustomImageWidget(
-                        imageUrl: profile.avatarUrl!,
-                        width: 88,
-                        height: 88,
-                        fit: BoxFit.cover,
-                        semanticLabel: '${profile.displayName} foto de perfil',
-                      )
-                    : Text(
-                        profile.displayName.isNotEmpty
-                            ? profile.displayName[0].toUpperCase()
-                            : '?',
-                        style: GoogleFonts.inter(
-                          fontWeight: FontWeight.bold,
-                          color: AppTheme.primary,
-                          fontSize: 22.sp,
-                        ),
-                      ),
-              ),
-            ),
-            SizedBox(height: 1.5.h),
-            Text(
-              profile.displayName,
-              style: GoogleFonts.inter(
-                fontWeight: FontWeight.w700,
-                fontSize: 16.sp,
-                color: theme.colorScheme.onSurface,
-              ),
-            ),
-            if (profile.bio != null) ...[
-              SizedBox(height: 0.5.h),
-              Text(
-                profile.bio!,
-                style: GoogleFonts.inter(
-                  fontSize: 12.sp,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-                textAlign: TextAlign.center,
-                maxLines: 3,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ],
-            SizedBox(height: 2.5.h),
-
-            // Compatibility ring card
-            Container(
-              width: double.infinity,
-              padding: EdgeInsets.symmetric(vertical: 2.5.h, horizontal: 5.w),
-              decoration: BoxDecoration(
-                color: color.withAlpha(20),
-                borderRadius: BorderRadius.circular(20.0),
-                border: Border.all(color: color.withAlpha(77), width: 1.5),
-              ),
-              child: Column(
-                children: [
-                  Text(
-                    'Compatibilidade com você',
-                    style: GoogleFonts.inter(
-                      fontSize: 12.sp,
-                      color: theme.colorScheme.onSurfaceVariant,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                  SizedBox(height: 1.h),
-                  _CompatibilityRing(percent: pct, color: color),
-                  SizedBox(height: 1.h),
-                  Text(
-                    _compatLabel(pct),
-                    style: GoogleFonts.inter(
-                      fontWeight: FontWeight.w700,
-                      fontSize: 14.sp,
-                      color: color,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            SizedBox(height: 2.h),
-
-            // Breakdown
-            _buildBreakdownCard(theme, fullResult),
-            SizedBox(height: 2.h),
-
-            // Interests chips
-            if (profile.hyperfocusInterests.isNotEmpty) ...[
-              _buildSection(
-                theme,
-                title: 'Hiperfocos',
-                icon: Icons.bolt_rounded,
-                child: Wrap(
-                  spacing: 8,
-                  runSpacing: 6,
-                  children: profile.hyperfocusInterests
-                      .map((i) => _chip(theme, i, AppTheme.secondary))
-                      .toList(),
-                ),
-              ),
-              SizedBox(height: 1.5.h),
-            ],
-
-            // Values chips
-            if (profile.valuesAndIdeas.isNotEmpty) ...[
-              _buildSection(
-                theme,
-                title: 'Valores & Ideias',
-                icon: Icons.favorite_border_rounded,
-                child: Wrap(
-                  spacing: 8,
-                  runSpacing: 6,
-                  children: profile.valuesAndIdeas
-                      .map((v) => _chip(theme, v, AppTheme.primary))
-                      .toList(),
-                ),
-              ),
-              SizedBox(height: 1.5.h),
-            ],
-
-            // Neurotypes
-            if (profile.neurotypes.isNotEmpty) ...[
-              _buildSection(
-                theme,
-                title: 'Neurotipo',
-                icon: Icons.psychology_rounded,
-                child: Wrap(
-                  spacing: 8,
-                  runSpacing: 6,
-                  children: profile.neurotypes
-                      .map(
-                        (n) =>
-                            _chip(theme, _neurotypeName(n), AppTheme.teaColor),
-                      )
-                      .toList(),
-                ),
-              ),
-              SizedBox(height: 2.h),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  ProfileMatchResult _buildFullResult() {
-    // Recalculate with full breakdown
-    final a = currentUser;
-    final b = result.profile;
-
-    double jaccard<T>(Set<T> setA, Set<T> setB) {
-      if (setA.isEmpty && setB.isEmpty) return 0.0;
-      final inter = setA.intersection(setB).length;
-      final union = setA.union(setB).length;
-      return union == 0 ? 0.0 : inter / union;
-    }
-
-    final interests = jaccard(
-      a.hyperfocusInterests.map((e) => e.toLowerCase().trim()).toSet(),
-      b.hyperfocusInterests.map((e) => e.toLowerCase().trim()).toSet(),
-    );
-    final values = jaccard(
-      a.valuesAndIdeas.map((e) => e.toLowerCase().trim()).toSet(),
-      b.valuesAndIdeas.map((e) => e.toLowerCase().trim()).toSet(),
-    );
-    final neuro = jaccard(a.neurotypes.toSet(), b.neurotypes.toSet());
-    final comm = jaccard(
-      a.communicationStyles.toSet(),
-      b.communicationStyles.toSet(),
-    );
-
-    final score =
-        (interests * 0.40) + (values * 0.35) + (neuro * 0.15) + (comm * 0.10);
-
-    return ProfileMatchResult(
-      profile: b,
-      matchScore: score.clamp(0.0, 1.0),
-      interestsScore: interests,
-      valuesScore: values,
-      neurotypesScore: neuro,
-      communicationScore: comm,
-    );
-  }
-
-  Widget _buildBreakdownCard(ThemeData theme, ProfileMatchResult r) {
-    return Container(
-      width: double.infinity,
-      padding: EdgeInsets.all(4.w),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(16.0),
-      ),
+  Widget _buildEmptyState(ThemeData theme) {
+    return Center(
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
         children: [
+          Icon(
+            Icons.person_search_rounded,
+            size: 48,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(height: 12),
           Text(
-            'Detalhes da Compatibilidade',
-            style: GoogleFonts.inter(
-              fontWeight: FontWeight.w600,
-              fontSize: 13.sp,
-              color: theme.colorScheme.onSurface,
-            ),
-          ),
-          SizedBox(height: 1.5.h),
-          _breakdownRow(
-            theme,
-            'Hiperfocos',
-            r.interestsScore,
-            '40%',
-            AppTheme.secondary,
-          ),
-          SizedBox(height: 1.h),
-          _breakdownRow(
-            theme,
-            'Valores & Ideias',
-            r.valuesScore,
-            '35%',
-            AppTheme.primary,
-          ),
-          SizedBox(height: 1.h),
-          _breakdownRow(
-            theme,
-            'Neurotipo',
-            r.neurotypesScore,
-            '15%',
-            AppTheme.teaColor,
-          ),
-          SizedBox(height: 1.h),
-          _breakdownRow(
-            theme,
-            'Comunicação',
-            r.communicationScore,
-            '10%',
-            AppTheme.tdahColor,
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _breakdownRow(
-    ThemeData theme,
-    String label,
-    double score,
-    String weight,
-    Color color,
-  ) {
-    final pct = (score * 100).round();
-    return Row(
-      children: [
-        Expanded(
-          flex: 3,
-          child: Text(
-            label,
-            style: GoogleFonts.inter(
-              fontSize: 11.sp,
+            'Digite para buscar perfis',
+            style: theme.textTheme.bodyMedium?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-        ),
-        Expanded(
-          flex: 5,
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(4.0),
-            child: LinearProgressIndicator(
-              value: score.clamp(0.0, 1.0),
-              backgroundColor: color.withAlpha(40),
-              valueColor: AlwaysStoppedAnimation<Color>(color),
-              minHeight: 8,
-            ),
-          ),
-        ),
-        const SizedBox(width: 8),
-        SizedBox(
-          width: 36,
-          child: Text(
-            '$pct%',
-            style: GoogleFonts.inter(
-              fontWeight: FontWeight.w700,
-              fontSize: 11.sp,
-              color: color,
-            ),
-            textAlign: TextAlign.right,
-          ),
-        ),
-        const SizedBox(width: 4),
-        Text(
-          weight,
-          style: GoogleFonts.inter(
-            fontSize: 10.sp,
-            color: theme.colorScheme.onSurfaceVariant,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildSection(
-    ThemeData theme, {
-    required String title,
-    required IconData icon,
-    required Widget child,
-  }) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Icon(icon, size: 16, color: AppTheme.primary),
-            const SizedBox(width: 6),
-            Text(
-              title,
-              style: GoogleFonts.inter(
-                fontWeight: FontWeight.w600,
-                fontSize: 12.sp,
-                color: theme.colorScheme.onSurface,
-              ),
-            ),
-          ],
-        ),
-        SizedBox(height: 0.8.h),
-        child,
-      ],
-    );
-  }
-
-  Widget _chip(ThemeData theme, String label, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withAlpha(26),
-        borderRadius: BorderRadius.circular(20.0),
-        border: Border.all(color: color.withAlpha(77)),
-      ),
-      child: Text(
-        label,
-        style: GoogleFonts.inter(
-          fontSize: 10.sp,
-          color: color,
-          fontWeight: FontWeight.w500,
-        ),
+        ],
       ),
     );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal wrapper to carry raw DB data alongside a ProfileMatchResult
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _ProfileMatchResultWithRaw extends ProfileMatchResult {
+  final Map<String, dynamic> raw;
+
+  _ProfileMatchResultWithRaw({
+    required ProfileMatchResult result,
+    required this.raw,
+  }) : super(
+         profile: result.profile,
+         matchScore: result.matchScore,
+         interestsScore: result.interestsScore,
+         valuesScore: result.valuesScore,
+         neurotypesScore: result.neurotypesScore,
+         communicationScore: result.communicationScore,
+         aiInsight: result.aiInsight,
+         aiRefined: result.aiRefined,
+       );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Affinity Profile Card
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _AffinityProfileCard extends StatelessWidget {
+  final ProfileMatchResult result;
+  final Map<String, dynamic> raw;
+  final UserProfile currentUser;
+  final VoidCallback onTap;
+  final int? rank;
+  final String highlightQuery;
+
+  const _AffinityProfileCard({
+    required this.result,
+    required this.raw,
+    required this.currentUser,
+    required this.onTap,
+    this.rank,
+    this.highlightQuery = '',
+  });
+
+  Color _scoreColor(int pct) {
+    if (pct >= 75) return AppTheme.success;
+    if (pct >= 50) return AppTheme.warning;
+    if (pct >= 25) return AppTheme.primary;
+    return AppTheme.error;
+  }
+
+  String _scoreLabel(int pct) {
+    if (pct >= 85) return 'Altíssima Sintonia ✨';
+    if (pct >= 70) return 'Boa Compatibilidade 💚';
+    if (pct >= 50) return 'Compatibilidade Moderada 🌱';
+    if (pct >= 25) return 'Baixa Compatibilidade';
+    return 'Pouca Afinidade';
   }
 
   String _neurotypeName(Neurotype n) {
@@ -726,90 +619,298 @@ class _ProfileDetailSheet extends StatelessWidget {
     };
     return names[n] ?? n.name;
   }
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Animated compatibility ring
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _CompatibilityRing extends StatefulWidget {
-  final int percent;
-  final Color color;
-
-  const _CompatibilityRing({required this.percent, required this.color});
-
-  @override
-  State<_CompatibilityRing> createState() => _CompatibilityRingState();
-}
-
-class _CompatibilityRingState extends State<_CompatibilityRing>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _ctrl;
-  late Animation<double> _anim;
-
-  @override
-  void initState() {
-    super.initState();
-    _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    );
-    _anim = Tween<double>(
-      begin: 0,
-      end: widget.percent / 100,
-    ).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOutCubic));
-    _ctrl.forward();
+  List<String> _commonInterests() {
+    final a = currentUser.hyperfocusInterests
+        .map((e) => e.toLowerCase().trim())
+        .toSet();
+    final b = result.profile.hyperfocusInterests
+        .map((e) => e.toLowerCase().trim())
+        .toSet();
+    return a.intersection(b).take(3).toList();
   }
 
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
+  List<String> _commonNeurotypes() {
+    final a = currentUser.neurotypes.toSet();
+    final b = result.profile.neurotypes.toSet();
+    return a.intersection(b).map(_neurotypeName).take(2).toList();
   }
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _anim,
-      builder: (_, __) => SizedBox(
-        width: 110,
-        height: 110,
-        child: Stack(
-          alignment: Alignment.center,
+    final theme = Theme.of(context);
+    final name = raw['full_name'] as String? ?? result.profile.displayName;
+    final username = raw['username'] as String? ?? '';
+    final avatarUrl =
+        raw['avatar_url'] as String? ?? result.profile.avatarUrl ?? '';
+    final bio = raw['bio'] as String? ?? result.profile.bio ?? '';
+    final neurodivType = raw['neurodiv_type'] as String? ?? '';
+    final pct = result.matchPercentage;
+    final color = _scoreColor(pct);
+    final commonInterests = _commonInterests();
+    final commonNeuro = _commonNeurotypes();
+    final hasCommonPoints =
+        commonInterests.isNotEmpty || commonNeuro.isNotEmpty;
+
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(16.0),
+          border: pct >= 70
+              ? Border.all(color: color.withAlpha(80), width: 1.2)
+              : null,
+        ),
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            SizedBox(
-              width: 110,
-              height: 110,
-              child: CircularProgressIndicator(
-                value: _anim.value,
-                strokeWidth: 10,
-                backgroundColor: widget.color.withAlpha(40),
-                valueColor: AlwaysStoppedAnimation<Color>(widget.color),
-                strokeCap: StrokeCap.round,
-              ),
-            ),
-            Column(
-              mainAxisSize: MainAxisSize.min,
+            // Avatar + rank badge
+            Stack(
+              clipBehavior: Clip.none,
               children: [
-                Text(
-                  '${(_anim.value * 100).round()}%',
-                  style: GoogleFonts.inter(
-                    fontWeight: FontWeight.w800,
-                    fontSize: 18.sp,
-                    color: widget.color,
-                  ),
+                CircleAvatar(
+                  radius: 26,
+                  backgroundColor: AppTheme.primaryContainer,
+                  backgroundImage: avatarUrl.isNotEmpty
+                      ? NetworkImage(avatarUrl)
+                      : null,
+                  child: avatarUrl.isEmpty
+                      ? Text(
+                          name.isNotEmpty ? name[0].toUpperCase() : '?',
+                          style: GoogleFonts.inter(
+                            color: AppTheme.primary,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 14.sp,
+                          ),
+                        )
+                      : null,
                 ),
-                Text(
-                  'sintonia',
-                  style: GoogleFonts.inter(
-                    fontSize: 9.sp,
-                    color: widget.color.withAlpha(180),
+                if (rank != null && rank! <= 3)
+                  Positioned(
+                    bottom: -4,
+                    right: -4,
+                    child: Container(
+                      width: 18,
+                      height: 18,
+                      decoration: BoxDecoration(
+                        color: rank == 1
+                            ? const Color(0xFFFFD700)
+                            : rank == 2
+                            ? const Color(0xFFC0C0C0)
+                            : const Color(0xFFCD7F32),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: theme.scaffoldBackgroundColor,
+                          width: 1.5,
+                        ),
+                      ),
+                      child: Center(
+                        child: Text(
+                          '$rank',
+                          style: GoogleFonts.inter(
+                            fontSize: 8.sp,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
                   ),
-                ),
               ],
+            ),
+            const SizedBox(width: 12),
+
+            // Info
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Name + score badge
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          name,
+                          style: GoogleFonts.inter(
+                            fontWeight: FontWeight.w600,
+                            fontSize: 13.sp,
+                            color: theme.colorScheme.onSurface,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      // Affinity score pill
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: color.withAlpha(30),
+                          borderRadius: BorderRadius.circular(20.0),
+                          border: Border.all(color: color.withAlpha(100)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.favorite_rounded,
+                              size: 10,
+                              color: color,
+                            ),
+                            const SizedBox(width: 3),
+                            Text(
+                              '$pct%',
+                              style: GoogleFonts.inter(
+                                fontSize: 10.sp,
+                                fontWeight: FontWeight.w700,
+                                color: color,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  // Username + neurodiv
+                  Row(
+                    children: [
+                      if (username.isNotEmpty) ...[
+                        Text(
+                          '@$username',
+                          style: GoogleFonts.inter(
+                            fontSize: 10.sp,
+                            color: AppTheme.primary,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                      ],
+                      if (neurodivType.isNotEmpty)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppTheme.teaColor.withAlpha(25),
+                            borderRadius: BorderRadius.circular(6.0),
+                          ),
+                          child: Text(
+                            neurodivType.toUpperCase(),
+                            style: GoogleFonts.inter(
+                              fontSize: 8.sp,
+                              fontWeight: FontWeight.w700,
+                              color: AppTheme.teaColor,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+
+                  // Bio
+                  if (bio.isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      bio,
+                      style: GoogleFonts.inter(
+                        fontSize: 10.sp,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+
+                  // Common points
+                  if (hasCommonPoints) ...[
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 4,
+                      runSpacing: 4,
+                      children: [
+                        if (commonNeuro.isNotEmpty)
+                          ...commonNeuro.map(
+                            (n) => _CommonChip(
+                              label: n,
+                              color: AppTheme.teaColor,
+                              icon: Icons.psychology_rounded,
+                            ),
+                          ),
+                        ...commonInterests.map(
+                          (i) => _CommonChip(
+                            label: i,
+                            color: AppTheme.secondary,
+                            icon: Icons.bolt_rounded,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+
+                  // Score label for high matches
+                  if (pct >= 50) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      _scoreLabel(pct),
+                      style: GoogleFonts.inter(
+                        fontSize: 9.sp,
+                        color: color,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Common point chip
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _CommonChip extends StatelessWidget {
+  final String label;
+  final Color color;
+  final IconData icon;
+
+  const _CommonChip({
+    required this.label,
+    required this.color,
+    required this.icon,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withAlpha(25),
+        borderRadius: BorderRadius.circular(20.0),
+        border: Border.all(color: color.withAlpha(80)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 10, color: color),
+          const SizedBox(width: 3),
+          Text(
+            label,
+            style: GoogleFonts.inter(
+              fontSize: 9.sp,
+              color: color,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
       ),
     );
   }

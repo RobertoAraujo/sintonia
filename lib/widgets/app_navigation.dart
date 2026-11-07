@@ -1,4 +1,5 @@
 import 'dart:io' if (dart.library.io) 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,13 +8,27 @@ import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../presentation/home_feed_screen/home_feed_screen.dart';
-import '../services/media_permission_service.dart';
 import '../services/supabase_service.dart';
 import '../theme/app_theme.dart';
 import './user_avatar_widget.dart';
 
 // Global callback so HomeFeedScreen can register its "open post modal" function
 typedef OpenPostModalCallback = void Function();
+
+/// A global notifier that any screen can set to `true` to signal that the
+/// unread-message badge in the bottom nav should be cleared immediately.
+/// ChatScreen calls `messageBadgeResetNotifier.value = true` whenever a
+/// conversation is opened so the badge disappears without waiting for the
+/// user to tap the Chat tab.
+final ValueNotifier<bool> messageBadgeResetNotifier = ValueNotifier(false);
+
+/// Global notifier for pending friend requests count.
+/// FriendsScreen updates this whenever the pending requests list changes.
+final ValueNotifier<int> pendingFriendRequestsNotifier = ValueNotifier(0);
+
+/// Global notifier for unread messages count.
+/// Used by HomeFeedScreen to show the badge on the bell icon.
+final ValueNotifier<int> unreadMessagesNotifier = ValueNotifier(0);
 
 class AppNavigation extends StatefulWidget {
   final StatefulNavigationShell navigationShell;
@@ -30,7 +45,7 @@ class AppNavigation extends StatefulWidget {
 }
 
 class _AppNavigationState extends State<AppNavigation> {
-  // Branches: 0=Feed, 1=Chat, 2=Grupos, 3=SintonIA, 4=Perfil
+  // Branches: 0=Feed, 1=Chat, 2=Amigos, 3=SintonIA, 4=Perfil
   static const List<_TabSpec> _tabs = [
     _TabSpec(
       label: 'Início',
@@ -45,9 +60,9 @@ class _AppNavigationState extends State<AppNavigation> {
       branchIndex: 1,
     ),
     _TabSpec(
-      label: 'Grupos',
-      icon: Icons.group_outlined,
-      activeIcon: Icons.group_rounded,
+      label: 'Amigos',
+      icon: Icons.people_outline_rounded,
+      activeIcon: Icons.people_rounded,
       branchIndex: 2,
     ),
     _TabSpec(
@@ -67,6 +82,7 @@ class _AppNavigationState extends State<AppNavigation> {
   int _unreadMessageCount = 0;
   RealtimeChannel? _unreadChannel;
   RealtimeChannel? _notificationChannel;
+  RealtimeChannel? _friendshipsChannel;
 
   int get _selectedIndex => widget.navigationShell.currentIndex;
 
@@ -76,26 +92,58 @@ class _AppNavigationState extends State<AppNavigation> {
     _loadUnreadCount();
     _subscribeToUnread();
     _initMessageNotifications();
+    _loadPendingFriendRequests();
+    _subscribeFriendships();
+    // Listen for badge-reset signals from ChatScreen (e.g. when a conversation is opened)
+    messageBadgeResetNotifier.addListener(_onBadgeResetRequested);
   }
 
   @override
   void dispose() {
+    messageBadgeResetNotifier.removeListener(_onBadgeResetRequested);
     _unreadChannel?.unsubscribe();
     _notificationChannel?.unsubscribe();
+    _friendshipsChannel?.unsubscribe();
     super.dispose();
+  }
+
+  void _onBadgeResetRequested() {
+    if (messageBadgeResetNotifier.value && mounted) {
+      setState(() => _unreadMessageCount = 0);
+      unreadMessagesNotifier.value = 0;
+      // Reset the notifier so future signals are detected
+      messageBadgeResetNotifier.value = false;
+    }
   }
 
   Future<void> _loadUnreadCount() async {
     final uid = SupabaseService.instance.currentUserId;
     if (uid == null) return;
     try {
+      // Get conversation IDs the user participates in
+      final participantRows = await SupabaseService.instance.client
+          .from('conversation_participants')
+          .select('conversation_id')
+          .eq('user_id', uid);
+      final convIds = (participantRows as List)
+          .map((r) => r['conversation_id'] as String?)
+          .whereType<String>()
+          .toList();
+      if (convIds.isEmpty) {
+        if (mounted) setState(() => _unreadMessageCount = 0);
+        return;
+      }
+      // Count unread messages sent by others in those conversations
       final data = await SupabaseService.instance.client
           .from('messages')
           .select('id')
-          .eq('receiver_id', uid)
+          .inFilter('conversation_id', convIds)
+          .neq('sender_id', uid)
           .eq('is_read', false);
       if (mounted) {
-        setState(() => _unreadMessageCount = (data as List).length);
+        final count = (data as List).length;
+        setState(() => _unreadMessageCount = count);
+        unreadMessagesNotifier.value = count;
       }
     } catch (_) {}
   }
@@ -110,16 +158,18 @@ class _AppNavigationState extends State<AppNavigation> {
           event: PostgresChangeEvent.insert,
           schema: 'public',
           table: 'messages',
-          filter: PostgresChangeFilter(
-            type: PostgresChangeFilterType.eq,
-            column: 'receiver_id',
-            value: uid,
-          ),
           callback: (payload) {
             final record = payload.newRecord;
+            final senderId = record['sender_id'] as String?;
             final isRead = record['is_read'] as bool? ?? false;
-            if (!isRead && mounted) {
+            // Only count messages from others AND only when NOT on Chat tab
+            if (senderId != null &&
+                senderId != uid &&
+                !isRead &&
+                mounted &&
+                _selectedIndex != 1) {
               setState(() => _unreadMessageCount++);
+              unreadMessagesNotifier.value = _unreadMessageCount;
             }
           },
         )
@@ -127,15 +177,13 @@ class _AppNavigationState extends State<AppNavigation> {
           event: PostgresChangeEvent.update,
           schema: 'public',
           table: 'messages',
-          filter: PostgresChangeFilter(
-            type: PostgresChangeFilterType.eq,
-            column: 'receiver_id',
-            value: uid,
-          ),
           callback: (payload) {
             // When messages are marked as read, refresh the count
+            // BUT only if the user is NOT already on the Chat tab —
+            // if they are on Chat tab the count was already reset to 0
+            // and we don't want a stale DB re-fetch to bring it back.
             final isRead = payload.newRecord['is_read'] as bool? ?? false;
-            if (isRead) {
+            if (isRead && _selectedIndex != 1) {
               _loadUnreadCount();
             }
           },
@@ -153,20 +201,86 @@ class _AppNavigationState extends State<AppNavigation> {
           event: PostgresChangeEvent.insert,
           schema: 'public',
           table: 'messages',
-          filter: PostgresChangeFilter(
-            type: PostgresChangeFilterType.eq,
-            column: 'receiver_id',
-            value: myUserId,
-          ),
           callback: (payload) {
             final newMsg = payload.newRecord;
-            // Only show banner when NOT on the Chat tab
-            if (_selectedIndex != 1 && mounted) {
+            final senderId = newMsg['sender_id'] as String?;
+            // Only show banner for messages from others, when NOT on Chat tab
+            if (senderId != null &&
+                senderId != myUserId &&
+                _selectedIndex != 1 &&
+                mounted) {
               _showMessageNotificationBanner(
-                senderId: newMsg['sender_id'] as String? ?? '',
+                senderId: senderId,
                 text: newMsg['content'] as String? ?? 'Nova mensagem recebida',
               );
             }
+          },
+        )
+        .subscribe();
+  }
+
+  Future<void> _loadPendingFriendRequests() async {
+    final uid = SupabaseService.instance.currentUserId;
+    if (uid == null) return;
+    try {
+      final data = await SupabaseService.instance.client
+          .from('friendships')
+          .select('id')
+          .eq('addressee_id', uid)
+          .eq('status', 'pending');
+      final count = (data as List).length;
+      if (mounted) {
+        pendingFriendRequestsNotifier.value = count;
+      }
+    } catch (_) {}
+  }
+
+  void _subscribeFriendships() {
+    final uid = SupabaseService.instance.currentUserId;
+    if (uid == null) return;
+
+    _friendshipsChannel = SupabaseService.instance.client
+        .channel('nav_friendships_$uid')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.insert,
+          schema: 'public',
+          table: 'friendships',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'addressee_id',
+            value: uid,
+          ),
+          callback: (payload) {
+            final status = payload.newRecord['status'] as String?;
+            if (status == 'pending') {
+              pendingFriendRequestsNotifier.value++;
+            }
+          },
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.update,
+          schema: 'public',
+          table: 'friendships',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'addressee_id',
+            value: uid,
+          ),
+          callback: (payload) {
+            final newStatus = payload.newRecord['status'] as String?;
+            // When accepted/rejected, refresh the count from DB
+            if (newStatus == 'accepted' || newStatus == 'rejected') {
+              _loadPendingFriendRequests();
+            }
+          },
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.delete,
+          schema: 'public',
+          table: 'friendships',
+          callback: (payload) {
+            // Refresh count on delete (decline)
+            _loadPendingFriendRequests();
           },
         )
         .subscribe();
@@ -178,7 +292,6 @@ class _AppNavigationState extends State<AppNavigation> {
   }) async {
     if (senderId.isEmpty) return;
     try {
-      // Try user_profiles view first, fall back to profiles table
       Map<String, dynamic>? profile;
       try {
         profile = await SupabaseService.instance.client
@@ -187,24 +300,6 @@ class _AppNavigationState extends State<AppNavigation> {
             .eq('id', senderId)
             .maybeSingle();
       } catch (_) {}
-
-      // Fallback: query profiles table if user_profiles returned nothing
-      if (profile == null) {
-        try {
-          profile = await SupabaseService.instance.client
-              .from('profiles')
-              .select('name, avatar_url')
-              .eq('id', senderId)
-              .maybeSingle();
-          // Normalise field name
-          if (profile != null && profile['name'] != null) {
-            profile = {
-              'full_name': profile['name'],
-              'avatar_url': profile['avatar_url'],
-            };
-          }
-        } catch (_) {}
-      }
 
       final senderName =
           ((profile?['full_name'] as String?)?.split(' ').first) ?? 'Alguém';
@@ -215,7 +310,11 @@ class _AppNavigationState extends State<AppNavigation> {
         SnackBar(
           content: Row(
             children: [
-              UserAvatar(avatarUrl: avatarUrl, displayName: senderName, radius: 16),
+              UserAvatar(
+                avatarUrl: avatarUrl,
+                displayName: senderName,
+                radius: 16,
+              ),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(
@@ -260,11 +359,14 @@ class _AppNavigationState extends State<AppNavigation> {
   }
 
   void _onTabTap(int branchIndex) {
-    // When switching to Chat tab, reset unread count optimistically
+    // When switching to Chat tab, reset unread count immediately
     if (branchIndex == 1) {
       setState(() => _unreadMessageCount = 0);
-      // Re-fetch after a short delay to get accurate count
-      Future.delayed(const Duration(seconds: 2), _loadUnreadCount);
+      unreadMessagesNotifier.value = 0;
+    }
+    // When switching to Friends tab, clear pending friend requests badge
+    if (branchIndex == 2) {
+      pendingFriendRequestsNotifier.value = 0;
     }
     widget.navigationShell.goBranch(
       branchIndex,
@@ -289,67 +391,70 @@ class _AppNavigationState extends State<AppNavigation> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final bottomPadding = MediaQuery.of(context).padding.bottom;
 
     return Container(
-      margin: EdgeInsets.fromLTRB(16, 0, 16, bottomPadding + 10),
+      margin: EdgeInsets.fromLTRB(16, 0, 16, bottomPadding + 14),
       decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
-        borderRadius: BorderRadius.circular(28),
+        color: Colors.white.withAlpha(235),
+        borderRadius: BorderRadius.circular(30),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withAlpha(22),
-            blurRadius: 20,
-            offset: const Offset(0, 6),
-          ),
-          BoxShadow(
-            color: Colors.black.withAlpha(10),
-            blurRadius: 6,
-            offset: const Offset(0, 2),
+            color: Colors.black.withAlpha(20),
+            blurRadius: 24,
+            spreadRadius: 2,
+            offset: const Offset(0, 8),
           ),
         ],
-        border: Border.all(color: theme.colorScheme.outlineVariant, width: 1),
       ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: [
-            // Tab 0: Início
-            _NavTabItem(
-              tab: _tabs[0],
-              isActive: _selectedIndex == 0,
-              onTap: () => _onTabTap(0),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(30),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                // Tab 0: Início
+                _NavTabItem(
+                  tab: _tabs[0],
+                  isActive: _selectedIndex == 0,
+                  onTap: () => _onTabTap(0),
+                ),
+                // Tab 1: Chat (with unread badge)
+                _NavTabItem(
+                  tab: _tabs[1],
+                  isActive: _selectedIndex == 1,
+                  onTap: () => _onTabTap(1),
+                ),
+                // Center: Criar Post
+                _CenterPostButton(onTap: _onCreatePostTap),
+                // Tab 2: Amigos (with pending requests badge)
+                ValueListenableBuilder<int>(
+                  valueListenable: pendingFriendRequestsNotifier,
+                  builder: (context, pendingCount, _) => _NavTabItemWithBadge(
+                    tab: _tabs[2],
+                    isActive: _selectedIndex == 2,
+                    onTap: () => _onTabTap(2),
+                    badgeCount: pendingCount,
+                  ),
+                ),
+                // Tab 3: SintonIA
+                _NavTabItem(
+                  tab: _tabs[3],
+                  isActive: _selectedIndex == 3,
+                  onTap: () => _onTabTap(3),
+                ),
+                // Tab 4: Perfil
+                _NavTabItem(
+                  tab: _tabs[4],
+                  isActive: _selectedIndex == 4,
+                  onTap: () => _onTabTap(4),
+                ),
+              ],
             ),
-            // Tab 1: Chat (with unread badge)
-            _NavTabItemWithBadge(
-              tab: _tabs[1],
-              isActive: _selectedIndex == 1,
-              onTap: () => _onTabTap(1),
-              badgeCount: _unreadMessageCount,
-            ),
-            // Center: Criar Post
-            _CenterPostButton(onTap: _onCreatePostTap),
-            // Tab 2: Grupos
-            _NavTabItem(
-              tab: _tabs[2],
-              isActive: _selectedIndex == 2,
-              onTap: () => _onTabTap(2),
-            ),
-            // Tab 3: SintonIA
-            _NavTabItem(
-              tab: _tabs[3],
-              isActive: _selectedIndex == 3,
-              onTap: () => _onTabTap(3),
-            ),
-            // Tab 4: Perfil
-            _NavTabItem(
-              tab: _tabs[4],
-              isActive: _selectedIndex == 4,
-              onTap: () => _onTabTap(4),
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -410,14 +515,6 @@ class _CreatePostBottomSheetState extends State<_CreatePostBottomSheet> {
   }
 
   Future<void> _pickImage() async {
-    if (!await MediaPermissionService.request(camera: false)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Permissão para acessar fotos negada.')),
-        );
-      }
-      return;
-    }
     try {
       final file = await _picker.pickImage(
         source: ImageSource.gallery,
@@ -910,8 +1007,31 @@ class _CenterPostButton extends StatefulWidget {
   State<_CenterPostButton> createState() => _CenterPostButtonState();
 }
 
-class _CenterPostButtonState extends State<_CenterPostButton> {
+class _CenterPostButtonState extends State<_CenterPostButton>
+    with SingleTickerProviderStateMixin {
   bool _pressed = false;
+  late AnimationController _pulseCtrl;
+  late Animation<double> _pulseAnim;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2000),
+    )..repeat(reverse: true);
+    _pulseAnim = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
+  }
+
+  @override
+  void dispose() {
+    _pulseCtrl.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
@@ -923,27 +1043,36 @@ class _CenterPostButtonState extends State<_CenterPostButton> {
       onTapCancel: () => setState(() => _pressed = false),
       child: AnimatedScale(
         scale: _pressed ? 0.88 : 1.0,
-        duration: const Duration(milliseconds: 120),
+        duration: const Duration(milliseconds: 130),
         curve: Curves.easeOutCubic,
-        child: Container(
-          width: 54,
-          height: 54,
-          decoration: BoxDecoration(
-            gradient: const LinearGradient(
-              colors: [AppTheme.primary, AppTheme.secondary],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
-            borderRadius: BorderRadius.circular(18),
-            boxShadow: [
-              BoxShadow(
-                color: AppTheme.primary.withAlpha(90),
-                blurRadius: 14,
-                offset: const Offset(0, 5),
+        child: AnimatedBuilder(
+          animation: _pulseAnim,
+          builder: (context, child) {
+            return Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF2E7D32), Color(0xFF42A5F5)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(
+                      0xFF2E7D32,
+                    ).withOpacity(0.25 + (_pulseAnim.value * 0.2)),
+                    blurRadius: 14 + (_pulseAnim.value * 8),
+                    spreadRadius: _pulseAnim.value * 2,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
               ),
-            ],
-          ),
-          child: const Icon(Icons.add_rounded, color: Colors.white, size: 30),
+              child: child,
+            );
+          },
+          child: const Icon(Icons.add_rounded, color: Colors.white, size: 28),
         ),
       ),
     );
@@ -991,10 +1120,9 @@ class _NavTabItemState extends State<_NavTabItem>
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final color = widget.isActive
-        ? AppTheme.primary
-        : theme.colorScheme.onSurfaceVariant;
+    const activeColor = Color(0xFF1B4D3E);
+    const inactiveColor = Color(0xFF757575);
+    final color = widget.isActive ? activeColor : inactiveColor;
 
     return GestureDetector(
       onTapDown: (_) => _ctrl.forward(),
@@ -1005,36 +1133,52 @@ class _NavTabItemState extends State<_NavTabItem>
       onTapCancel: () => _ctrl.reverse(),
       child: ScaleTransition(
         scale: _scaleAnim,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 200),
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-          decoration: BoxDecoration(
-            color: widget.isActive
-                ? AppTheme.primary.withAlpha(15)
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(14),
-          ),
+        child: SizedBox(
+          width: 52,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              AnimatedSwitcher(
-                duration: const Duration(milliseconds: 200),
-                child: Icon(
-                  widget.isActive ? widget.tab.activeIcon : widget.tab.icon,
-                  key: ValueKey(widget.isActive),
-                  color: color,
-                  size: 24,
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeOutCubic,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: widget.isActive
+                      ? const Color(0xFFE8F5E9)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  transitionBuilder: (child, anim) =>
+                      ScaleTransition(scale: anim, child: child),
+                  child: Icon(
+                    widget.isActive ? widget.tab.activeIcon : widget.tab.icon,
+                    key: ValueKey(widget.isActive),
+                    color: color,
+                    size: 22,
+                  ),
                 ),
               ),
               const SizedBox(height: 3),
-              Text(
-                widget.tab.label,
+              AnimatedDefaultTextStyle(
+                duration: const Duration(milliseconds: 200),
                 style: TextStyle(
-                  fontSize: 10,
+                  fontSize: 9.5,
                   fontWeight: widget.isActive
                       ? FontWeight.w700
-                      : FontWeight.w500,
+                      : FontWeight.w400,
                   color: color,
+                  letterSpacing: 0,
+                ),
+                child: Text(
+                  widget.tab.label,
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
             ],
@@ -1088,10 +1232,9 @@ class _NavTabItemWithBadgeState extends State<_NavTabItemWithBadge>
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final color = widget.isActive
-        ? AppTheme.primary
-        : theme.colorScheme.onSurfaceVariant;
+    const activeColor = Color(0xFF1B4D3E);
+    const inactiveColor = Color(0xFF757575);
+    final color = widget.isActive ? activeColor : inactiveColor;
 
     return GestureDetector(
       onTapDown: (_) => _ctrl.forward(),
@@ -1102,72 +1245,105 @@ class _NavTabItemWithBadgeState extends State<_NavTabItemWithBadge>
       onTapCancel: () => _ctrl.reverse(),
       child: ScaleTransition(
         scale: _scaleAnim,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 200),
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-          decoration: BoxDecoration(
-            color: widget.isActive
-                ? AppTheme.primary.withAlpha(15)
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(14),
-          ),
+        child: SizedBox(
+          width: 52,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Stack(
-                clipBehavior: Clip.none,
-                children: [
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 200),
-                    child: Icon(
-                      widget.isActive ? widget.tab.activeIcon : widget.tab.icon,
-                      key: ValueKey(widget.isActive),
-                      color: color,
-                      size: 24,
-                    ),
-                  ),
-                  if (widget.badgeCount > 0)
-                    Positioned(
-                      top: -4,
-                      right: -6,
-                      child: Container(
-                        constraints: const BoxConstraints(
-                          minWidth: 16,
-                          minHeight: 16,
-                        ),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 4,
-                          vertical: 1,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.red,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.white, width: 1.5),
-                        ),
-                        child: Text(
-                          widget.badgeCount > 99
-                              ? '99+'
-                              : '${widget.badgeCount}',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 9,
-                            fontWeight: FontWeight.w700,
-                          ),
-                          textAlign: TextAlign.center,
-                        ),
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeOutCubic,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: widget.isActive
+                      ? const Color(0xFFE8F5E9)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 200),
+                      transitionBuilder: (child, anim) =>
+                          ScaleTransition(scale: anim, child: child),
+                      child: Icon(
+                        widget.isActive
+                            ? widget.tab.activeIcon
+                            : widget.tab.icon,
+                        key: ValueKey(widget.isActive),
+                        color: color,
+                        size: 22,
                       ),
                     ),
-                ],
+                    if (widget.badgeCount > 0)
+                      Positioned(
+                        top: -5,
+                        right: -8,
+                        child: AnimatedScale(
+                          scale: widget.badgeCount > 0 ? 1.0 : 0.0,
+                          duration: const Duration(milliseconds: 200),
+                          curve: Curves.elasticOut,
+                          child: Container(
+                            constraints: const BoxConstraints(
+                              minWidth: 16,
+                              minHeight: 16,
+                            ),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 4,
+                              vertical: 1,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFFF3B30),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: Colors.white,
+                                width: 1.5,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.red.withAlpha(102),
+                                  blurRadius: 6,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ],
+                            ),
+                            child: Text(
+                              widget.badgeCount > 99
+                                  ? '99+'
+                                  : '${widget.badgeCount}',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 9,
+                                fontWeight: FontWeight.w800,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
               ),
               const SizedBox(height: 3),
-              Text(
-                widget.tab.label,
+              AnimatedDefaultTextStyle(
+                duration: const Duration(milliseconds: 200),
                 style: TextStyle(
-                  fontSize: 10,
+                  fontSize: 9.5,
                   fontWeight: widget.isActive
                       ? FontWeight.w700
-                      : FontWeight.w500,
+                      : FontWeight.w400,
                   color: color,
+                  letterSpacing: 0,
+                ),
+                child: Text(
+                  widget.tab.label,
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
             ],

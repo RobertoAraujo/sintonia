@@ -70,9 +70,9 @@ class SupabaseRecommendationRepository {
   /// Fetches candidates, scores them against [currentUser], and returns
   /// the top [limit] results sorted by compatibility descending.
   ///
-  /// Tries the server-side `get_compatible_users` RPC first (uses the
-  /// PostgreSQL `calculate_compatibility` function for ordering).
-  /// Falls back to client-side scoring if the RPC is unavailable.
+  /// Tries the server-side `get_recommended_connections` RPC first (uses the
+  /// PostgreSQL Haversine + weighted compatibility function for ordering).
+  /// Falls back to the legacy `get_compatible_users` RPC, then client-side scoring.
   /// After initial scoring, refines rankings using Gemini AI analysis.
   Future<List<ProfileMatchResult>> fetchRecommendations({
     required UserProfile currentUser,
@@ -80,29 +80,32 @@ class SupabaseRecommendationRepository {
   }) async {
     List<ProfileMatchResult> initialResults = [];
 
-    // ── Try server-side RPC first ─────────────────────────────────────────
+    // ── Try new get_recommended_connections RPC first ─────────────────────
     try {
       final uid = SupabaseService.instance.currentUserId;
       if (uid != null) {
         final rows = await SupabaseService.instance.client.rpc(
-          'get_compatible_users',
-          params: {'requesting_user_id': uid, 'result_limit': limit},
+          'get_recommended_connections',
+          params: {'current_user_id': uid, 'max_distance_km': 50.0},
         );
         if (rows is List && rows.isNotEmpty) {
           final results = <ProfileMatchResult>[];
           for (final row in rows) {
             final r = row as Map<String, dynamic>;
-            final profile = _mapDbRowToUserProfile({
-              'id': r['user_id'],
-              'full_name': r['full_name'],
-              'avatar_url': r['avatar_url'],
-              'bio': r['bio'],
-              'neurodiv_type': r['neurodiv_type'],
-              'hyperfocuses': r['hyperfocuses'],
-              'interests': r['interests'],
-              'communication_preferences': r['communication_preferences'],
-            });
-            final pct = (r['compatibility_pct'] as int? ?? 0).toDouble();
+            final hyperfocusList = _jsonListToStrings(r['hyperfocus']);
+            final interestsList = _jsonListToStrings(r['interests']);
+            final profile = UserProfile(
+              id: (r['user_id'] as String?) ?? '',
+              displayName: (r['display_name'] as String?) ?? 'Usuário',
+              avatarUrl: r['avatar_url'] as String?,
+              bio: r['bio'] as String?,
+              neurotypes: [],
+              hyperfocusInterests: [...hyperfocusList, ...interestsList],
+              communicationStyles: [],
+              valuesAndIdeas: [],
+            );
+            final pct = (r['compatibility_score'] as int? ?? 30).toDouble();
+            final distKm = r['distance_km'] as double?;
             results.add(
               ProfileMatchResult(
                 profile: profile,
@@ -111,6 +114,7 @@ class SupabaseRecommendationRepository {
                 valuesScore: 0,
                 neurotypesScore: 0,
                 communicationScore: 0,
+                distanceKm: distKm,
               ),
             );
           }
@@ -119,9 +123,55 @@ class SupabaseRecommendationRepository {
       }
     } catch (e) {
       debugPrint(
-        'SupabaseRecommendationRepository: RPC get_compatible_users failed, '
-        'falling back to client-side scoring. Error: $e',
+        'SupabaseRecommendationRepository: RPC get_recommended_connections failed, '
+        'trying legacy RPC. Error: $e',
       );
+    }
+
+    // ── Try legacy get_compatible_users RPC ───────────────────────────────
+    if (initialResults.isEmpty) {
+      try {
+        final uid = SupabaseService.instance.currentUserId;
+        if (uid != null) {
+          final rows = await SupabaseService.instance.client.rpc(
+            'get_compatible_users',
+            params: {'requesting_user_id': uid, 'result_limit': limit},
+          );
+          if (rows is List && rows.isNotEmpty) {
+            final results = <ProfileMatchResult>[];
+            for (final row in rows) {
+              final r = row as Map<String, dynamic>;
+              final profile = _mapDbRowToUserProfile({
+                'id': r['user_id'],
+                'full_name': r['full_name'],
+                'avatar_url': r['avatar_url'],
+                'bio': r['bio'],
+                'neurodiv_type': r['neurodiv_type'],
+                'hyperfocuses': r['hyperfocuses'],
+                'interests': r['interests'],
+                'communication_preferences': r['communication_preferences'],
+              });
+              final pct = (r['compatibility_pct'] as int? ?? 0).toDouble();
+              results.add(
+                ProfileMatchResult(
+                  profile: profile,
+                  matchScore: pct / 100,
+                  interestsScore: pct / 100,
+                  valuesScore: 0,
+                  neurotypesScore: 0,
+                  communicationScore: 0,
+                ),
+              );
+            }
+            initialResults = results;
+          }
+        }
+      } catch (e) {
+        debugPrint(
+          'SupabaseRecommendationRepository: RPC get_compatible_users failed, '
+          'falling back to client-side scoring. Error: $e',
+        );
+      }
     }
 
     // ── Client-side fallback ──────────────────────────────────────────────
@@ -145,8 +195,6 @@ class SupabaseRecommendationRepository {
     }
 
     // ── Gemini AI refinement ──────────────────────────────────────────────
-    // Re-rank the top candidates using Gemini's deeper analysis of
-    // hyperfocus depth, communication compatibility, and neurodivergence alignment.
     try {
       final refined = await _gemini.refineRankings(
         currentUser: currentUser,
@@ -161,6 +209,26 @@ class SupabaseRecommendationRepository {
       );
       return initialResults;
     }
+  }
+
+  /// Converts a dynamic JSON list (from Supabase) to a List<String>.
+  /// Handles both plain strings and Map objects (extracts the 'name' field).
+  List<String> _jsonListToStrings(dynamic raw) {
+    if (raw == null) return [];
+    if (raw is List) {
+      return raw
+          .map((e) {
+            if (e is Map) {
+              // Extract 'name' field if present, otherwise try 'label' or 'title'
+              final name = e['name'] ?? e['label'] ?? e['title'];
+              return name?.toString() ?? '';
+            }
+            return e.toString();
+          })
+          .where((s) => s.isNotEmpty)
+          .toList();
+    }
+    return [];
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -219,7 +287,16 @@ class SupabaseRecommendationRepository {
     final raw = row[key];
     if (raw == null) return [];
     if (raw is List) {
-      return raw.map((e) => e.toString()).toList();
+      return raw
+          .map((e) {
+            if (e is Map) {
+              final name = e['name'] ?? e['label'] ?? e['title'];
+              return name?.toString() ?? '';
+            }
+            return e.toString();
+          })
+          .where((s) => s.isNotEmpty)
+          .toList();
     }
     return [];
   }

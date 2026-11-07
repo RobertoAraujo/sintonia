@@ -8,19 +8,19 @@ import '../../core/app_export.dart';
 import '../../core/services/aiIntegrations/chat_completion_service.dart';
 import '../../models/user_profile.dart';
 import '../../services/avatar_notifier.dart';
-import '../../services/media_permission_service.dart';
 import '../../services/media_processing_service.dart';
 import '../../services/notification_service.dart';
 import '../../services/supabase_service.dart';
 import '../../services/user_settings_service.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/share_helper.dart';
-import '../../widgets/app_scaffold.dart' show registerGlobalPostModal;
+import '../../widgets/app_scaffold.dart'
+    show registerGlobalPostModal, navBarVisibleNotifier;
+import '../../widgets/app_navigation.dart' show unreadMessagesNotifier;
 import '../media_upload/media_upload_modal.dart';
 import '../profile_search_screen/profile_search_screen.dart';
 import '../user_profile_screen/user_profile_screen.dart';
 import './widgets/post_card_widget.dart';
-import './widgets/status_strip_widget.dart';
 
 // Global callback so the navigation-level post modal can add posts to the feed
 void Function(Map<String, dynamic>)? globalAddPostCallback;
@@ -39,12 +39,36 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
   String? _postsError;
   dynamic _feedSubscription;
 
+  // Scroll controller for hide-on-scroll nav bar behaviour
+  final ScrollController _feedScrollController = ScrollController();
+  double _lastScrollOffset = 0.0;
+
   Map<String, dynamic>? _currentUserProfile;
 
   // Dynamic greeting & quote from Gemini
   String _dynamicSaudacao = '';
   String _dynamicQuote = '';
   bool _isLoadingQuote = false;
+
+  /// Removes stray backslashes, escape sequences and loose quotes from AI output.
+  String _sanitizeQuote(String raw) {
+    String cleaned = raw
+        .replaceAll(r'\n', ' ')
+        .replaceAll(r'\r', '')
+        .replaceAll(r'\t', ' ')
+        .replaceAll(r'\"', '')
+        .replaceAll(r"\'", '')
+        .replaceAll(r'\\', '')
+        .replaceAll('"', '')
+        .replaceAll("'", '')
+        .trim();
+    // Collapse multiple spaces
+    cleaned = cleaned.replaceAll(RegExp(r' {2,}'), ' ');
+    if (cleaned.isEmpty || cleaned.length < 5) {
+      return 'O descanso da alma consiste em confiar Naquele que soberanamente cuida de cada detalhe do nosso caminho.';
+    }
+    return cleaned;
+  }
 
   final List<Map<String, dynamic>> _statusList = [];
   final List<Map<String, dynamic>> _postsMaps = [];
@@ -70,6 +94,7 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
         if (mounted) setState(() => _postsMaps.insert(0, post));
       };
     });
+    _feedScrollController.addListener(_onFeedScroll);
     _loadCurrentUser();
     _loadFeedPosts();
     _loadStories();
@@ -78,12 +103,35 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
     _loadDynamicGreeting();
   }
 
+  void _onFeedScroll() {
+    final offset = _feedScrollController.offset;
+    final delta = offset - _lastScrollOffset;
+    _lastScrollOffset = offset;
+
+    // Show nav bar when near the top
+    if (offset <= 10) {
+      if (!navBarVisibleNotifier.value) navBarVisibleNotifier.value = true;
+      return;
+    }
+
+    // Hide on scroll down, show on scroll up (threshold 8px to avoid jitter)
+    if (delta > 8 && navBarVisibleNotifier.value) {
+      navBarVisibleNotifier.value = false;
+    } else if (delta < -8 && !navBarVisibleNotifier.value) {
+      navBarVisibleNotifier.value = true;
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     AvatarNotifier.instance.removeListener(_onAvatarChanged);
     NotificationService.instance.removeListener(_onNotificationsChanged);
     NotificationService.instance.unsubscribeRealtime();
+    _feedScrollController.removeListener(_onFeedScroll);
+    _feedScrollController.dispose();
+    // Ensure nav bar is visible when leaving this screen
+    navBarVisibleNotifier.value = true;
     if (_feedSubscription != null) {
       SupabaseService.instance.unsubscribe(_feedSubscription!);
     }
@@ -93,7 +141,7 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
   void _onNotificationsChanged() {
     if (!mounted) return;
     setState(() {
-      _notificationUnreadCount = NotificationService.instance.unreadCount;
+      _notificationUnreadCount = NotificationService.instance.socialUnreadCount;
     });
   }
 
@@ -111,7 +159,8 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
     NotificationService.instance.subscribeRealtime();
     if (mounted) {
       setState(() {
-        _notificationUnreadCount = NotificationService.instance.unreadCount;
+        _notificationUnreadCount =
+            NotificationService.instance.socialUnreadCount;
       });
     }
   }
@@ -178,36 +227,34 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
 
     // Fallback quotes in case AI is unavailable
     const fallbackQuotes = [
-      'O coração do homem determina o seu caminho, mas o Senhor lhe dirige os passos.',
-      'Guardes o teu coração com toda a diligência, porque dele procedem as fontes da vida.',
-      'A resposta branda desvia o furor, mas a palavra dura suscita a ira.',
-      'Como a água reflete o rosto, assim o coração do homem reflete quem ele é.',
-      'Melhor é o bom nome do que as muitas riquezas, e o favor é melhor do que a prata e o ouro.',
-      'Espera no Senhor, tem bom ânimo, e ele fortalecerá o teu coração.',
-      'A verdadeira sabedoria consiste no conhecimento de quem realmente somos e no entendimento das coisas do alto.',
-      'O contentamento não vem de ter tudo o que se deseja, mas de confiar naquilo que é providenciado.',
-      'Um coração humilde é a base sobre a qual todas as outras virtudes se sustentam.',
-      'O tempo é breve e a eternidade é longa; viva cada momento com intenção e propósito.',
-      'A paz interior não é a ausência de dificuldades, mas a presença de uma firmeza inabalável.',
-      'A gratidão altera a perspectiva da vida e transforma deveres comuns em momentos de alegria.',
-      'Nenhuma circunstância externa tem o poder de perturbar a mente que repousa em convicções sólidas.',
+      'O descanso da alma consiste em confiar Naquele que soberanamente cuida de cada detalhe do nosso caminho.',
+      'A paz que o mundo não pode dar é aquela que permanece inabalável mesmo quando tudo ao redor parece incerto.',
+      'Humilhar-se diante do que não podemos controlar é o primeiro passo para encontrar a verdadeira liberdade interior.',
+      'O contentamento não é a posse de muitas coisas, mas a gratidão pelas que já foram concedidas.',
+      'A paciência na aflição não é fraqueza — é a evidência de uma confiança mais profunda do que as circunstâncias.',
+      'Nenhuma tempestade dura para sempre; e aquele que governa os ventos também cuida dos que navegam neles.',
+      'A verdadeira sabedoria começa quando reconhecemos que não somos os autores da nossa própria história.',
+      'Um coração grato transforma o peso do dia em leveza, e o ordinário em extraordinário.',
+      'A soberania sobre nossas vidas não está em nossas mãos — e isso, paradoxalmente, é a maior fonte de paz.',
+      'Não é a ausência de dificuldades que define o caráter, mas a firmeza com que as atravessamos.',
+      'Aquele que repousa em algo maior do que si mesmo nunca está verdadeiramente sozinho.',
+      'A graça não exige que você seja perfeito antes de ser acolhido — ela te acolhe exatamente como você é.',
+      'O tempo é um presente; cada momento vivido com intenção é uma semente plantada para a eternidade.',
     ];
 
     try {
       final systemPrompt =
-          'Você é um gerador de reflexões diárias elegantes e anônimas. '
-          'Gere uma saudação e uma frase de reflexão profunda baseada no horário informado. '
-          'Use EXCLUSIVAMENTE textos fiéis à Bíblia de Genebra ou frases de grandes teólogos Calvinistas e Puritanos '
-          '(João Calvino, John Owen, Thomas Watson, Jeremiah Burroughs, Richard Sibbes, Jonathan Edwards, Charles Spurgeon, J.C. Ryle, Martyn Lloyd-Jones). '
-          'NUNCA inclua nome do livro, capítulo, versículo ou nome do autor. '
-          'As frases devem soar como sabedoria profunda e reflexão interior. '
-          'Alterne temas: sabedoria, paz interior, paciência, prudência, humildade, firmeza de caráter, gratidão, tempo. '
-          'Responda APENAS em JSON válido no formato: {"saudacao": "<saudação>", "frase": "<texto da frase>"}';
+          'Você é um gerador de sentenças reflexivas curtas para o topo de um aplicativo de bem-estar.\n\n'
+          'DIRETRIZES ESTRITAS:\n'
+          '1. Gere apenas UMA frase curta (máximo 20 a 25 palavras) fundamentada em teólogos puritanos ou presbiterianos escoceses clássicos (Samuel Rutherford, Thomas Boston, John Owen, Thomas Watson, Thomas Goodwin) ou passagens da Bíblia de Genebra.\n'
+          '2. NUNCA coloque nomes de autores, pregadores, livros bíblicos, capítulos ou números de versículos.\n'
+          '3. NÃO retorne barras de escape, aspas duplas, aspas simples ou qualquer caractere especial. Retorne apenas o texto puro da frase.\n'
+          '4. Temas: Soberania divina, paciência na tempestade, descanso na providência, contentamento e graça incondicional.\n'
+          '5. Responda APENAS em JSON válido no formato: {"saudacao": "<saudação>", "frase": "<texto puro da frase sem aspas>"}\n'
+          '6. A saudação deve seguir: 05-11h = Bom dia, | 12-17h = Boa tarde, | 18-04h = Boa noite,';
 
       final userPrompt =
-          'Hora atual: $hora. '
-          'Regras de saudação: 05-11h = "Bom dia,", 12-17h = "Boa tarde,", 18-04h = "Boa noite,". '
-          'Gere uma frase inédita e variada. Responda apenas com o JSON.';
+          'Hora atual: $hora. Gere uma frase inédita e variada. Responda apenas com o JSON.';
 
       final response = await getChatCompletion(
         'GEMINI',
@@ -217,8 +264,8 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
           {'role': 'user', 'content': userPrompt},
         ],
         parameters: {
-          'temperature': 0.9,
-          'max_tokens': 200,
+          'temperature': 0.8,
+          'max_tokens': 150,
           'response_format': {'type': 'json_object'},
         },
       );
@@ -237,11 +284,12 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
             r'"saudacao"\s*:\s*"([^"]+)"',
           ).firstMatch(jsonStr);
           final fraseMatch = RegExp(
-            r'"frase"\s*:\s*"([^"]+)"',
+            r'"frase"\s*:\s*"([^"]*)"',
           ).firstMatch(jsonStr);
 
           final saudacao = saudacaoMatch?.group(1) ?? fallbackSaudacao;
-          final frase = fraseMatch?.group(1) ?? '';
+          final rawFrase = fraseMatch?.group(1) ?? '';
+          final frase = _sanitizeQuote(rawFrase);
 
           if (mounted && frase.isNotEmpty) {
             setState(() {
@@ -335,6 +383,9 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
         final likedIds = await SupabaseService.instance.fetchLikedPostIds(
           postIds,
         );
+        final savedIds = await SupabaseService.instance.fetchSavedPostIds(
+          postIds,
+        );
         final mapped = posts.map((p) {
           final author = p['author'] as Map<String, dynamic>? ?? {};
           final postId = p['id'] as String? ?? '';
@@ -349,6 +400,7 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
             'hyperfocusTags':
                 (p['hyperfocus_tags'] as List?)?.cast<String>() ?? [],
             'content': p['content'] ?? '',
+            'visibility': p['visibility'] ?? 'public',
             'imageUrl': (p['image_url'] as String?)?.isNotEmpty == true
                 ? p['image_url']
                 : null,
@@ -358,7 +410,7 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
             'saves': 0,
             'timeAgo': _timeAgo(p['created_at']),
             'isLiked': likedIds.contains(postId),
-            'isSaved': false,
+            'isSaved': savedIds.contains(postId),
           };
         }).toList();
         if (mounted) {
@@ -411,6 +463,7 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
           'hyperfocusTags':
               (fullPost['hyperfocus_tags'] as List?)?.cast<String>() ?? [],
           'content': fullPost['content'] ?? '',
+          'visibility': fullPost['visibility'] ?? 'public',
           'imageUrl': (fullPost['image_url'] as String?)?.isNotEmpty == true
               ? fullPost['image_url']
               : null,
@@ -474,6 +527,23 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
       SupabaseService.instance.unsavePost(postId);
     } else {
       SupabaseService.instance.savePost(postId);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Row(
+            children: [
+              Icon(Icons.bookmark_rounded, color: Colors.white, size: 18),
+              SizedBox(width: 8),
+              Text('Publicação salva com sucesso!'),
+            ],
+          ),
+          backgroundColor: const Color(0xFF1B4D3E),
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          duration: const Duration(seconds: 2),
+        ),
+      );
     }
   }
 
@@ -519,10 +589,12 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
   }
 
   void _sharePost(Map<String, dynamic> post) {
-    ShareHelper.sharePost(
+    ShareHelper.showShareBottomSheet(
+      context,
       postId: post['id'] as String,
       authorName: post['authorName'] as String? ?? 'Usuário',
       postContentText: post['content'] as String?,
+      postImageUrl: post['imageUrl'] as String?,
     );
   }
 
@@ -541,6 +613,377 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
         ),
       );
     }
+  }
+
+  void _editPost(Map<String, dynamic> post) {
+    final postId = post['id'] as String;
+    final captionController = TextEditingController(
+      text: post['content'] as String? ?? '',
+    );
+    String selectedVisibility = (post['visibility'] as String?) ?? 'public';
+    // Existing image URL from the post
+    String? existingImageUrl = post['imageUrl'] as String?;
+    XFile? pickedImageFile;
+    bool imageRemoved = false;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            final theme = Theme.of(ctx);
+
+            Future<void> pickImage() async {
+              final picker = ImagePicker();
+              final picked = await picker.pickImage(
+                source: ImageSource.gallery,
+                imageQuality: 85,
+              );
+              if (picked != null) {
+                setModalState(() {
+                  pickedImageFile = picked;
+                  imageRemoved = false;
+                });
+              }
+            }
+
+            // Determine what to show in the preview
+            final bool hasPreview =
+                pickedImageFile != null ||
+                (existingImageUrl != null &&
+                    existingImageUrl.isNotEmpty &&
+                    !imageRemoved);
+
+            return Padding(
+              padding: EdgeInsets.only(
+                bottom: MediaQuery.of(ctx).viewInsets.bottom,
+              ),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surface,
+                  borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(24),
+                  ),
+                ),
+                padding: EdgeInsets.fromLTRB(
+                  20,
+                  16,
+                  20,
+                  24 + MediaQuery.of(ctx).padding.bottom + 70,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Handle bar
+                    Center(
+                      child: Container(
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.outlineVariant,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.edit_outlined,
+                          color: theme.colorScheme.primary,
+                          size: 22,
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          'Editar publicação',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          onPressed: () => Navigator.pop(ctx),
+                          icon: const Icon(Icons.close_rounded),
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: captionController,
+                      maxLines: 5,
+                      minLines: 3,
+                      decoration: InputDecoration(
+                        hintText: 'O que você quer compartilhar hoje? ✨',
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(16),
+                          borderSide: BorderSide(
+                            color: theme.colorScheme.outlineVariant,
+                          ),
+                        ),
+                        filled: true,
+                        fillColor: theme.colorScheme.surfaceContainerHighest
+                            .withAlpha(80),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    // Photo section
+                    if (hasPreview) ...[
+                      Stack(
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: pickedImageFile != null
+                                ? (kIsWeb
+                                      ? Image.network(
+                                          pickedImageFile!.path,
+                                          height: 160,
+                                          width: double.infinity,
+                                          fit: BoxFit.cover,
+                                        )
+                                      : Image.file(
+                                          File(pickedImageFile!.path),
+                                          height: 160,
+                                          width: double.infinity,
+                                          fit: BoxFit.cover,
+                                        ))
+                                : Image.network(
+                                    existingImageUrl!,
+                                    height: 160,
+                                    width: double.infinity,
+                                    fit: BoxFit.cover,
+                                  ),
+                          ),
+                          Positioned(
+                            top: 6,
+                            right: 6,
+                            child: GestureDetector(
+                              onTap: () => setModalState(() {
+                                pickedImageFile = null;
+                                imageRemoved = true;
+                              }),
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  color: Colors.black54,
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                padding: const EdgeInsets.all(4),
+                                child: const Icon(
+                                  Icons.close_rounded,
+                                  color: Colors.white,
+                                  size: 18,
+                                ),
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            bottom: 6,
+                            right: 6,
+                            child: GestureDetector(
+                              onTap: pickImage,
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  color: theme.colorScheme.primary,
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 6,
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: const [
+                                    Icon(
+                                      Icons.photo_library_outlined,
+                                      color: Colors.white,
+                                      size: 14,
+                                    ),
+                                    SizedBox(width: 4),
+                                    Text(
+                                      'Trocar',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                    ] else ...[
+                      OutlinedButton.icon(
+                        onPressed: pickImage,
+                        icon: const Icon(Icons.add_photo_alternate_outlined),
+                        label: const Text('Adicionar foto'),
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size(double.infinity, 44),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
+                    Text(
+                      'Visibilidade:',
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        _VisibilityChip(
+                          label: 'Todos',
+                          value: 'public',
+                          selected: selectedVisibility == 'public',
+                          onTap: () => setModalState(
+                            () => selectedVisibility = 'public',
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        _VisibilityChip(
+                          label: 'Amigos',
+                          value: 'friends',
+                          selected: selectedVisibility == 'friends',
+                          onTap: () => setModalState(
+                            () => selectedVisibility = 'friends',
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        _VisibilityChip(
+                          label: 'Somente eu',
+                          value: 'private',
+                          selected: selectedVisibility == 'private',
+                          onTap: () => setModalState(
+                            () => selectedVisibility = 'private',
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: () async {
+                          final newContent = captionController.text.trim();
+                          if (newContent.isEmpty && !hasPreview) return;
+                          Navigator.pop(ctx);
+
+                          // Upload new image if picked
+                          String? newImageUrl;
+                          if (pickedImageFile != null) {
+                            final bytes = await pickedImageFile!.readAsBytes();
+                            final ext = pickedImageFile!.name
+                                .split('.')
+                                .last
+                                .toLowerCase();
+                            newImageUrl = await SupabaseService.instance
+                                .uploadPostImage(bytes, ext);
+                          }
+
+                          // Determine final imageUrl to pass
+                          // If removed and no new pick → pass empty string to clear
+                          // If new pick → pass new URL
+                          // If unchanged → pass null (no update)
+                          String? imageUrlToUpdate;
+                          if (pickedImageFile != null) {
+                            imageUrlToUpdate = newImageUrl;
+                          } else if (imageRemoved) {
+                            imageUrlToUpdate = '';
+                          }
+
+                          final success = await SupabaseService.instance
+                              .updatePost(
+                                postId,
+                                content: newContent,
+                                visibility: selectedVisibility,
+                                imageUrl: imageUrlToUpdate,
+                              );
+                          if (success && mounted) {
+                            final updatedPost = await SupabaseService.instance
+                                .fetchSinglePost(postId);
+                            if (mounted) {
+                              setState(() {
+                                final idx = _postsMaps.indexWhere(
+                                  (p) => p['id'] == postId,
+                                );
+                                if (idx != -1) {
+                                  if (updatedPost != null) {
+                                    final author =
+                                        updatedPost['author']
+                                            as Map<String, dynamic>? ??
+                                        {};
+                                    _postsMaps[idx] = {
+                                      ..._postsMaps[idx],
+                                      'content':
+                                          updatedPost['content'] ?? newContent,
+                                      'visibility':
+                                          updatedPost['visibility'] ??
+                                          selectedVisibility,
+                                      'imageUrl':
+                                          updatedPost['image_url'] ??
+                                          _postsMaps[idx]['imageUrl'],
+                                      'authorName':
+                                          author['full_name'] ??
+                                          _postsMaps[idx]['authorName'],
+                                      'authorImage':
+                                          author['avatar_url'] ??
+                                          _postsMaps[idx]['authorImage'],
+                                    };
+                                  } else {
+                                    _postsMaps[idx] = {
+                                      ..._postsMaps[idx],
+                                      'content': newContent,
+                                      'visibility': selectedVisibility,
+                                      if (imageUrlToUpdate != null)
+                                        'imageUrl': imageUrlToUpdate.isEmpty
+                                            ? null
+                                            : imageUrlToUpdate,
+                                    };
+                                  }
+                                }
+                              });
+                            }
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: const Text('Publicação atualizada! ✅'),
+                                behavior: SnackBarBehavior.floating,
+                                backgroundColor: Colors.green.shade600,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                            );
+                          }
+                        },
+                        icon: const Icon(Icons.check_rounded),
+                        label: const Text('Salvar alterações'),
+                        style: FilledButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   void _openUserProfile(String authorId) {
@@ -756,243 +1199,281 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
   }
 
   void _showNotificationsSheet() {
-    // Mark all as read when opening the sheet
     final notifService = NotificationService.instance;
-    final notifications = notifService.notifications;
-    final unreadCount = notifService.unreadCount;
 
-    // Mark all unread as read
-    for (final n in notifications.where((n) => !n.isRead)) {
-      notifService.markAsRead(n.id);
-    }
+    // Ensure we have fresh data before opening the sheet
+    notifService.fetchNotifications();
+
+    // Reset local badge immediately
     if (mounted) setState(() => _notificationUnreadCount = 0);
 
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setSheetState) => DraggableScrollableSheet(
-          initialChildSize: 0.65,
-          minChildSize: 0.4,
-          maxChildSize: 0.9,
-          builder: (_, scrollController) => Container(
-            decoration: BoxDecoration(
-              color: Theme.of(ctx).colorScheme.surface,
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(28),
-              ),
-            ),
-            child: Column(
-              children: [
-                // Handle
-                Container(
-                  margin: const EdgeInsets.only(top: 12, bottom: 4),
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Theme.of(ctx).colorScheme.outlineVariant,
-                    borderRadius: BorderRadius.circular(2),
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.65,
+        minChildSize: 0.4,
+        maxChildSize: 0.9,
+        builder: (_, scrollController) => Container(
+          decoration: BoxDecoration(
+            color: Theme.of(ctx).colorScheme.surface,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+          ),
+          child: ListenableBuilder(
+            listenable: notifService,
+            builder: (context, _) {
+              final thirtyMinutesAgo = DateTime.now().subtract(
+                const Duration(minutes: 30),
+              );
+              final notifications = notifService.notifications
+                  .where(
+                    (n) =>
+                        n.type != NotificationType.message &&
+                        n.createdAt.isAfter(thirtyMinutesAgo),
+                  )
+                  .toList();
+              final unreadCount = notifService.socialUnreadCount;
+
+              return Column(
+                children: [
+                  // Handle
+                  Container(
+                    margin: const EdgeInsets.only(top: 12, bottom: 4),
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Theme.of(ctx).colorScheme.outlineVariant,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 20,
-                    vertical: 12,
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.notifications_rounded,
-                        color: AppTheme.primary,
-                      ),
-                      const SizedBox(width: 10),
-                      Text(
-                        'Notificações',
-                        style: Theme.of(ctx).textTheme.titleLarge,
-                      ),
-                      const Spacer(),
-                      if (unreadCount > 0)
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.red.withAlpha(20),
-                            borderRadius: BorderRadius.circular(100),
-                          ),
-                          child: Text(
-                            '$unreadCount novas',
-                            style: Theme.of(ctx).textTheme.labelSmall?.copyWith(
-                              color: Colors.red,
-                              fontWeight: FontWeight.w700,
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 12,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.notifications_rounded,
+                          color: AppTheme.primary,
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          'Notificações',
+                          style: Theme.of(ctx).textTheme.titleLarge,
+                        ),
+                        const Spacer(),
+                        if (unreadCount > 0)
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.red.withAlpha(20),
+                              borderRadius: BorderRadius.circular(100),
+                            ),
+                            child: Text(
+                              '$unreadCount novas',
+                              style: Theme.of(ctx).textTheme.labelSmall
+                                  ?.copyWith(
+                                    color: Colors.red,
+                                    fontWeight: FontWeight.w700,
+                                  ),
                             ),
                           ),
-                        ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-                const Divider(height: 1),
-                Expanded(
-                  child: notifications.isEmpty
-                      ? Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                Icons.notifications_none_rounded,
-                                size: 48,
-                                color: Theme.of(ctx).colorScheme.outlineVariant,
-                              ),
-                              const SizedBox(height: 12),
-                              Text(
-                                'Nenhuma notificação ainda',
-                                style: Theme.of(ctx).textTheme.bodyMedium
-                                    ?.copyWith(
-                                      color: Theme.of(
-                                        ctx,
-                                      ).colorScheme.onSurfaceVariant,
-                                    ),
-                              ),
-                            ],
-                          ),
-                        )
-                      : ListView.builder(
-                          controller: scrollController,
-                          padding: const EdgeInsets.symmetric(vertical: 8),
-                          itemCount: notifications.length,
-                          itemBuilder: (_, i) {
-                            final n = notifications[i];
-                            final isRead = n.isRead;
-                            final iconData = _notifIcon(n.type);
-                            final iconColor = _notifColor(n.type);
-                            final timeStr = _timeAgo(
-                              n.createdAt.toIso8601String(),
-                            );
-                            return Container(
-                              color: isRead
-                                  ? Colors.transparent
-                                  : AppTheme.primary.withAlpha(8),
-                              child: ListTile(
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 20,
-                                  vertical: 6,
+                  const Divider(height: 1),
+                  Expanded(
+                    child: notifService.isLoading && notifications.isEmpty
+                        ? Center(
+                            child: CircularProgressIndicator(
+                              color: AppTheme.primary,
+                            ),
+                          )
+                        : notifications.isEmpty
+                        ? Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.notifications_none_rounded,
+                                  size: 48,
+                                  color: Theme.of(
+                                    ctx,
+                                  ).colorScheme.outlineVariant,
                                 ),
-                                leading: Stack(
-                                  children: [
-                                    CircleAvatar(
-                                      radius: 24,
-                                      backgroundImage:
-                                          n.actorAvatarUrl != null &&
-                                              n.actorAvatarUrl!.isNotEmpty
-                                          ? NetworkImage(n.actorAvatarUrl!)
-                                          : null,
-                                      backgroundColor:
-                                          AppTheme.primaryContainer,
-                                      child:
-                                          n.actorAvatarUrl == null ||
-                                              n.actorAvatarUrl!.isEmpty
-                                          ? Text(
-                                              (n.actorName ?? 'U')[0]
-                                                  .toUpperCase(),
-                                              style: const TextStyle(
-                                                color: AppTheme.primary,
-                                                fontWeight: FontWeight.w700,
-                                              ),
-                                            )
-                                          : null,
-                                    ),
-                                    Positioned(
-                                      right: 0,
-                                      bottom: 0,
-                                      child: Container(
-                                        width: 20,
-                                        height: 20,
-                                        decoration: BoxDecoration(
-                                          color: iconColor,
-                                          shape: BoxShape.circle,
-                                          border: Border.all(
-                                            color: Theme.of(
-                                              ctx,
-                                            ).colorScheme.surface,
-                                            width: 2,
-                                          ),
-                                        ),
-                                        child: Icon(
-                                          iconData,
-                                          size: 11,
-                                          color: Colors.white,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                title: Text(
-                                  n.title,
+                                const SizedBox(height: 12),
+                                Text(
+                                  'Nenhuma notificação nos últimos 30 minutos',
                                   style: Theme.of(ctx).textTheme.bodyMedium
                                       ?.copyWith(
-                                        fontWeight: isRead
-                                            ? FontWeight.w400
-                                            : FontWeight.w700,
+                                        color: Theme.of(
+                                          ctx,
+                                        ).colorScheme.onSurfaceVariant,
                                       ),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
                                 ),
-                                subtitle: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    if (n.body.isNotEmpty)
-                                      Text(
-                                        n.body,
-                                        style: Theme.of(ctx).textTheme.bodySmall
-                                            ?.copyWith(
+                              ],
+                            ),
+                          )
+                        : ListView.builder(
+                            controller: scrollController,
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            itemCount: notifications.length,
+                            itemBuilder: (_, i) {
+                              final n = notifications[i];
+                              final isRead = n.isRead;
+                              final iconData = _notifIcon(n.type);
+                              final iconColor = _notifColor(n.type);
+                              final timeStr = _timeAgo(
+                                n.createdAt.toIso8601String(),
+                              );
+                              return Container(
+                                color: isRead
+                                    ? Colors.transparent
+                                    : AppTheme.primary.withAlpha(8),
+                                child: ListTile(
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 20,
+                                    vertical: 6,
+                                  ),
+                                  leading: Stack(
+                                    children: [
+                                      CircleAvatar(
+                                        radius: 24,
+                                        backgroundImage:
+                                            n.actorAvatarUrl != null &&
+                                                n.actorAvatarUrl!.isNotEmpty
+                                            ? NetworkImage(n.actorAvatarUrl!)
+                                            : null,
+                                        backgroundColor:
+                                            AppTheme.primaryContainer,
+                                        child:
+                                            n.actorAvatarUrl == null ||
+                                                n.actorAvatarUrl!.isEmpty
+                                            ? Text(
+                                                (n.actorName ?? 'U')[0]
+                                                    .toUpperCase(),
+                                                style: const TextStyle(
+                                                  color: AppTheme.primary,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              )
+                                            : null,
+                                      ),
+                                      Positioned(
+                                        right: 0,
+                                        bottom: 0,
+                                        child: Container(
+                                          width: 20,
+                                          height: 20,
+                                          decoration: BoxDecoration(
+                                            color: iconColor,
+                                            shape: BoxShape.circle,
+                                            border: Border.all(
                                               color: Theme.of(
                                                 ctx,
-                                              ).colorScheme.onSurfaceVariant,
+                                              ).colorScheme.surface,
+                                              width: 2,
                                             ),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      timeStr,
-                                      style: Theme.of(ctx).textTheme.labelSmall
-                                          ?.copyWith(
-                                            color: isRead
-                                                ? Theme.of(
-                                                    ctx,
-                                                  ).colorScheme.onSurfaceVariant
-                                                : AppTheme.primary,
-                                            fontWeight: isRead
-                                                ? FontWeight.w400
-                                                : FontWeight.w600,
                                           ),
-                                    ),
-                                  ],
-                                ),
-                                trailing: isRead
-                                    ? null
-                                    : Container(
-                                        width: 8,
-                                        height: 8,
-                                        decoration: const BoxDecoration(
-                                          color: AppTheme.primary,
-                                          shape: BoxShape.circle,
+                                          child: Icon(
+                                            iconData,
+                                            size: 11,
+                                            color: Colors.white,
+                                          ),
                                         ),
                                       ),
-                                onTap: () => Navigator.pop(ctx),
-                              ),
-                            );
-                          },
-                        ),
-                ),
-              ],
-            ),
+                                    ],
+                                  ),
+                                  title: Text(
+                                    n.title,
+                                    style: Theme.of(ctx).textTheme.bodyMedium
+                                        ?.copyWith(
+                                          fontWeight: isRead
+                                              ? FontWeight.w400
+                                              : FontWeight.w700,
+                                        ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  subtitle: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      if (n.body.isNotEmpty)
+                                        Text(
+                                          n.body,
+                                          style: Theme.of(ctx)
+                                              .textTheme
+                                              .bodySmall
+                                              ?.copyWith(
+                                                color: Theme.of(
+                                                  ctx,
+                                                ).colorScheme.onSurfaceVariant,
+                                              ),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        timeStr,
+                                        style: Theme.of(ctx)
+                                            .textTheme
+                                            .labelSmall
+                                            ?.copyWith(
+                                              color: isRead
+                                                  ? Theme.of(ctx)
+                                                        .colorScheme
+                                                        .onSurfaceVariant
+                                                  : AppTheme.primary,
+                                              fontWeight: isRead
+                                                  ? FontWeight.w400
+                                                  : FontWeight.w600,
+                                            ),
+                                      ),
+                                    ],
+                                  ),
+                                  trailing: isRead
+                                      ? null
+                                      : Container(
+                                          width: 8,
+                                          height: 8,
+                                          decoration: const BoxDecoration(
+                                            color: AppTheme.primary,
+                                            shape: BoxShape.circle,
+                                          ),
+                                        ),
+                                  onTap: () => Navigator.pop(ctx),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              );
+            },
           ),
         ),
       ),
-    );
+    ).then((_) {
+      // Mark all as read when the sheet is closed
+      if (notifService.socialUnreadCount > 0) {
+        notifService.markAllAsRead();
+      }
+      if (mounted) setState(() => _notificationUnreadCount = 0);
+    });
+
+    // Mark all as read shortly after opening so badge clears while user views
+    Future.delayed(const Duration(milliseconds: 800), () {
+      if (notifService.socialUnreadCount > 0) {
+        notifService.markAllAsRead();
+      }
+      if (mounted) setState(() => _notificationUnreadCount = 0);
+    });
   }
 
   IconData _notifIcon(NotificationType type) {
@@ -1006,6 +1487,10 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
         return Icons.person_add_rounded;
       case NotificationType.message:
         return Icons.message_rounded;
+      case NotificationType.postEdit:
+        return Icons.edit_rounded;
+      case NotificationType.report:
+        return Icons.flag_rounded;
     }
   }
 
@@ -1020,6 +1505,10 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
         return AppTheme.secondary;
       case NotificationType.message:
         return Colors.orange;
+      case NotificationType.postEdit:
+        return Colors.blueGrey;
+      case NotificationType.report:
+        return Colors.deepOrange;
     }
   }
 
@@ -1092,6 +1581,7 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
           onRefresh: _handleRefresh,
           color: AppTheme.primary,
           child: CustomScrollView(
+            controller: _feedScrollController,
             slivers: [
               // App Bar
               SliverToBoxAdapter(
@@ -1134,8 +1624,8 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
                                   )
                                 : Text(
                                     _dynamicQuote.isNotEmpty
-                                        ? '"$_dynamicQuote"'
-                                        : '',
+                                        ? '"${_sanitizeQuote(_dynamicQuote)}"'
+                                        : '"O descanso da alma consiste em confiar Naquele que soberanamente cuida de cada detalhe do nosso caminho."',
                                     style: theme.textTheme.bodySmall?.copyWith(
                                       color: theme.colorScheme.onSurfaceVariant,
                                       fontStyle: FontStyle.italic,
@@ -1187,66 +1677,64 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
                         ),
                         tooltip: 'Buscar Perfis',
                       ),
-                      IconButton(
-                        onPressed: () => _showNotificationsSheet(),
-                        icon: Stack(
-                          clipBehavior: Clip.none,
-                          children: [
-                            Icon(
-                              _notificationUnreadCount > 0
-                                  ? Icons.notifications_rounded
-                                  : Icons.notifications_outlined,
-                              color: theme.colorScheme.onSurface,
-                              size: 26,
-                            ),
-                            if (_notificationUnreadCount > 0)
-                              Positioned(
-                                right: -2,
-                                top: -2,
-                                child: Container(
-                                  constraints: const BoxConstraints(
-                                    minWidth: 16,
-                                    minHeight: 16,
-                                  ),
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 3,
-                                    vertical: 1,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.red,
-                                    borderRadius: BorderRadius.circular(8),
-                                    border: Border.all(
-                                      color: theme.colorScheme.surface,
-                                      width: 1.5,
-                                    ),
-                                  ),
-                                  child: Text(
-                                    _notificationUnreadCount > 99
-                                        ? '99+'
-                                        : '$_notificationUnreadCount',
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 9,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                    textAlign: TextAlign.center,
-                                  ),
+                      ValueListenableBuilder<int>(
+                        valueListenable: unreadMessagesNotifier,
+                        builder: (context, unreadMsgs, _) {
+                          final totalUnread =
+                              _notificationUnreadCount + unreadMsgs;
+                          return IconButton(
+                            onPressed: () => _showNotificationsSheet(),
+                            icon: Stack(
+                              clipBehavior: Clip.none,
+                              children: [
+                                Icon(
+                                  totalUnread > 0
+                                      ? Icons.notifications_rounded
+                                      : Icons.notifications_outlined,
+                                  color: theme.colorScheme.onSurface,
+                                  size: 26,
                                 ),
-                              ),
-                          ],
-                        ),
+                                if (totalUnread > 0)
+                                  Positioned(
+                                    right: -2,
+                                    top: -2,
+                                    child: Container(
+                                      constraints: const BoxConstraints(
+                                        minWidth: 16,
+                                        minHeight: 16,
+                                      ),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 3,
+                                        vertical: 1,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: Colors.red,
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                          color: theme.colorScheme.surface,
+                                          width: 1.5,
+                                        ),
+                                      ),
+                                      child: Text(
+                                        totalUnread > 99
+                                            ? '99+'
+                                            : '$totalUnread',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 9,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                        textAlign: TextAlign.center,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          );
+                        },
                       ),
                     ],
                   ),
-                ),
-              ),
-
-              // Status Strip
-              SliverToBoxAdapter(
-                child: StatusStripWidget(
-                  statusList: _statusList,
-                  onStatusTap: _openStatusViewer,
-                  onPostStatus: _showAddStatusModal,
                 ),
               ),
 
@@ -1270,6 +1758,9 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
                       }
                       final post = _postsMaps[index];
                       return PostCardWidget(
+                        key: ValueKey(
+                          '${post['id']}_${post['content']}_${post['visibility']}',
+                        ),
                         post: post,
                         onLike: () => _toggleLike(post['id'] as String),
                         onComment: () => _openComments(post['id'] as String),
@@ -1281,6 +1772,11 @@ class _HomeFeedScreenState extends State<HomeFeedScreen>
                             (post['authorId'] as String?) ==
                                 SupabaseService.instance.currentUserId
                             ? () => _deletePost(post['id'] as String)
+                            : null,
+                        onEdit:
+                            (post['authorId'] as String?) ==
+                                SupabaseService.instance.currentUserId
+                            ? () => _editPost(post)
                             : null,
                       );
                     }, childCount: _postsMaps.length + 1),
@@ -1324,18 +1820,6 @@ class _CreatePostModalState extends State<_CreatePostModal> {
     required ImageSource source,
   }) async {
     try {
-      final allowed = await MediaPermissionService.request(
-        camera: source == ImageSource.camera,
-        video: isVideo,
-      );
-      if (!allowed) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Permissão de fotos/câmera negada.')),
-          );
-        }
-        return;
-      }
       XFile? file;
       if (isVideo) {
         file = await _picker.pickVideo(
@@ -2086,6 +2570,52 @@ class _CommentsModalState extends State<_CommentsModal> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _VisibilityChip extends StatelessWidget {
+  final String label;
+  final String value;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _VisibilityChip({
+    required this.label,
+    required this.value,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected
+              ? theme.colorScheme.primary
+              : theme.colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: selected
+                ? theme.colorScheme.primary
+                : theme.colorScheme.outlineVariant,
+          ),
+        ),
+        child: Text(
+          label,
+          style: theme.textTheme.labelMedium?.copyWith(
+            color: selected
+                ? theme.colorScheme.onPrimary
+                : theme.colorScheme.onSurfaceVariant,
+            fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+          ),
         ),
       ),
     );

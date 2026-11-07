@@ -50,6 +50,23 @@ class UserSettingsService {
     }
   }
 
+  /// Fetch settings for any user by ID (used to enforce privacy on their profile).
+  Future<Map<String, dynamic>> fetchSettingsForUser(String userId) async {
+    try {
+      final data = await _client
+          .from('user_settings')
+          .select()
+          .eq('user_id', userId)
+          .maybeSingle();
+
+      if (data == null) return Map<String, dynamic>.from(_defaults);
+      return Map<String, dynamic>.from(data);
+    } catch (e) {
+      debugPrint('UserSettingsService.fetchSettingsForUser error: $e');
+      return Map<String, dynamic>.from(_defaults);
+    }
+  }
+
   /// Update a single boolean setting field.
   Future<void> updateSetting(String field, bool value) async {
     final uid = SupabaseService.instance.currentUserId;

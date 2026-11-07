@@ -2,9 +2,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:go_router/go_router.dart';
-import '../../theme/app_theme.dart';
 import '../../routes/app_routes.dart';
 import '../../services/supabase_service.dart';
+import '../../services/security_service.dart';
+import '../forgot_password_screen/forgot_password_screen.dart';
+
+// ── Auth-only neon palette ──────────────────────────────────────────────────
+const _kBg = Color(0xFF0A0A0E);
+const _kPurple = Color(0xFFC026D3);
+const _kViolet = Color(0xFF7C3AED);
+const _kCyan = Color(0xFF00D2FF);
+const _kFieldBg = Color(0xFF18181B);
+const _kHint = Color(0xFFA1A1AA);
+// ───────────────────────────────────────────────────────────────────────────
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -20,7 +30,12 @@ class _LoginScreenState extends State<LoginScreen>
   final _passwordCtrl = TextEditingController();
   bool _obscurePassword = true;
   bool _isLoading = false;
+  bool _isResettingPassword = false;
   String? _errorMessage;
+
+  // ── Brute-force protection ──────────────────────────────────────────────
+  DateTime? _lockoutExpiry;
+  int _failedAttempts = 0;
 
   late AnimationController _fadeCtrl;
   late Animation<double> _fadeAnim;
@@ -39,6 +54,30 @@ class _LoginScreenState extends State<LoginScreen>
       end: Offset.zero,
     ).animate(CurvedAnimation(parent: _fadeCtrl, curve: Curves.easeOutCubic));
     _fadeCtrl.forward();
+    _checkLockoutStatus();
+  }
+
+  Future<void> _checkLockoutStatus() async {
+    final expiry = await SecurityService.instance.getLoginLockoutExpiry();
+    final attempts = await SecurityService.instance.getFailedAttemptCount();
+    if (mounted) {
+      setState(() {
+        _lockoutExpiry = expiry;
+        _failedAttempts = attempts;
+      });
+    }
+  }
+
+  bool get _isLockedOut {
+    if (_lockoutExpiry == null) return false;
+    return DateTime.now().isBefore(_lockoutExpiry!);
+  }
+
+  String get _lockoutMessage {
+    if (_lockoutExpiry == null) return '';
+    final remaining = _lockoutExpiry!.difference(DateTime.now());
+    final mins = remaining.inMinutes + 1;
+    return 'Muitas tentativas. Tente novamente em $mins minuto${mins > 1 ? 's' : ''}.';
   }
 
   @override
@@ -50,19 +89,48 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   Future<void> _login() async {
+    // ── Brute-force lockout check ──────────────────────────────────────────
+    await _checkLockoutStatus();
+    if (_isLockedOut) {
+      setState(() => _errorMessage = _lockoutMessage);
+      return;
+    }
+
     if (!_formKey.currentState!.validate()) return;
     setState(() {
       _isLoading = true;
       _errorMessage = null;
     });
     try {
+      // ── Sanitize inputs before use ─────────────────────────────────────
+      final email = SecurityService.sanitizeEmail(_emailCtrl.text.trim());
+      final password = _passwordCtrl
+          .text; // passwords are NOT sanitized (preserve special chars)
+
+      // 1. Authenticate with credentials
       final response = await SupabaseService.instance.signIn(
-        email: _emailCtrl.text.trim(),
-        password: _passwordCtrl.text,
+        email: email,
+        password: password,
       );
       if (!mounted) return;
+
       if (response.user != null) {
-        // Check if user has completed first-time setup
+        // ── Clear failed attempts on success ───────────────────────────
+        await SecurityService.instance.clearLoginAttempts();
+
+        // 2. Check if 2FA is enabled for this user
+        final is2FAEnabled =
+            response.user!.userMetadata?['two_fa_enabled'] == true;
+
+        if (is2FAEnabled) {
+          // Send 2FA code and redirect to verification screen
+          await SupabaseService.instance.send2FACode(email: email);
+          if (!mounted) return;
+          setState(() => _isLoading = false);
+          context.push(AppRoutes.twoFactorVerify, extra: email);
+          return;
+        }
+
         final profile = await SupabaseService.instance
             .fetchCurrentUserProfile();
         if (!mounted) return;
@@ -74,6 +142,8 @@ class _LoginScreenState extends State<LoginScreen>
           context.go(AppRoutes.homeFeedScreen);
         }
       } else {
+        await SecurityService.instance.recordFailedLoginAttempt();
+        await _checkLockoutStatus();
         setState(() {
           _isLoading = false;
           _errorMessage = 'Não foi possível fazer login. Tente novamente.';
@@ -81,37 +151,106 @@ class _LoginScreenState extends State<LoginScreen>
       }
     } catch (e) {
       if (!mounted) return;
+      // ── Record failed attempt on auth error ────────────────────────────
+      await SecurityService.instance.recordFailedLoginAttempt();
+      await _checkLockoutStatus();
+      final remaining = SecurityService.maxAttempts - _failedAttempts;
+      final errorStr = e.toString();
+      // Handle "account not found" case — direct to signup
+      if (errorStr.contains('Invalid login credentials') ||
+          errorStr.contains('invalid_credentials')) {
+        setState(() {
+          _isLoading = false;
+          _errorMessage = _isLockedOut
+              ? _lockoutMessage
+              : _mapAuthError(errorStr, remaining);
+        });
+      } else {
+        setState(() {
+          _isLoading = false;
+          _errorMessage = _isLockedOut
+              ? _lockoutMessage
+              : _mapAuthError(errorStr, remaining);
+        });
+      }
+    }
+  }
+
+  Future<void> _forgotPassword() async {
+    final email = _emailCtrl.text.trim();
+    if (email.isEmpty) {
+      setState(
+        () => _errorMessage = 'Digite seu e-mail para redefinir a senha.',
+      );
+      return;
+    }
+    final emailRegex = RegExp(
+      r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$',
+    );
+    if (!emailRegex.hasMatch(email)) {
+      setState(() => _errorMessage = 'Digite um e-mail válido.');
+      return;
+    }
+    setState(() {
+      _isResettingPassword = true;
+      _errorMessage = null;
+    });
+    try {
+      await SupabaseService.instance.client.auth.resetPasswordForEmail(email);
+      if (!mounted) return;
+      setState(() => _isResettingPassword = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text(
+            'E-mail de redefinição enviado! Verifique sua caixa de entrada.',
+          ),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: _kViolet,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _isLoading = false;
-        _errorMessage = _mapAuthError(e.toString());
+        _isResettingPassword = false;
+        _errorMessage = 'Não foi possível enviar o e-mail. Tente novamente.';
       });
     }
   }
 
-  String _mapAuthError(String error) {
+  String _mapAuthError(String error, [int? remainingAttempts]) {
+    String base;
     if (error.contains('Invalid login credentials') ||
         error.contains('invalid_credentials')) {
-      return 'E-mail ou senha incorretos.';
+      base = 'E-mail ou senha incorretos.';
+    } else if (error.contains('Email not confirmed')) {
+      base = 'Confirme seu e-mail antes de entrar.';
+    } else if (error.contains('Too many requests')) {
+      base = 'Muitas tentativas. Aguarde um momento.';
+    } else if (error.contains('network') || error.contains('SocketException')) {
+      base = 'Sem conexão. Verifique sua internet.';
+    } else {
+      base = 'Erro ao entrar. Tente novamente.';
     }
-    if (error.contains('Email not confirmed')) {
-      return 'Confirme seu e-mail antes de entrar.';
+
+    if (remainingAttempts != null &&
+        remainingAttempts > 0 &&
+        remainingAttempts < SecurityService.maxAttempts) {
+      base +=
+          ' ($remainingAttempts tentativa${remainingAttempts > 1 ? 's' : ''} restante${remainingAttempts > 1 ? 's' : ''})';
     }
-    if (error.contains('Too many requests')) {
-      return 'Muitas tentativas. Aguarde um momento.';
-    }
-    if (error.contains('network') || error.contains('SocketException')) {
-      return 'Sem conexão. Verifique sua internet.';
-    }
-    return 'Erro ao entrar. Tente novamente.';
+    return base;
   }
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final size = MediaQuery.of(context).size;
 
     return Scaffold(
-      backgroundColor: AppTheme.backgroundLight,
+      backgroundColor: _kBg,
       body: SafeArea(
         child: SingleChildScrollView(
           physics: const ClampingScrollPhysics(),
@@ -129,102 +268,125 @@ class _LoginScreenState extends State<LoginScreen>
                 child: SlideTransition(
                   position: _slideAnim,
                   child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                    crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
                       const SizedBox(height: 52),
+                      // ── Logo + Title ──────────────────────────────────
                       Center(
                         child: Column(
                           children: [
-                            Container(
-                              width: 100,
-                              height: 100,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: AppTheme.primary.withAlpha(50),
-                                    blurRadius: 24,
-                                    offset: const Offset(0, 8),
+                            Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                Container(
+                                  width: 130,
+                                  height: 130,
+                                  decoration: const BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: RadialGradient(
+                                      colors: [
+                                        Color(0x55C026D3),
+                                        Color(0x337C3AED),
+                                        Colors.transparent,
+                                      ],
+                                    ),
                                   ),
-                                ],
-                              ),
-                              child: ClipOval(
-                                child: Image.asset(
-                                  'assets/images/image-1789169868770.png',
-                                  fit: BoxFit.cover,
-                                  semanticLabel: 'SintonIA logotipo',
+                                ),
+                                Image.asset(
+                                  'assets/images/logo-sem-fundo.png',
+                                  width: 140,
+                                  height: 102,
+                                  fit: BoxFit.contain,
+                                  semanticLabel:
+                                      'SintonIA logo com balões de conversa em gradiente roxo e azul neon',
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 14),
+                            ShaderMask(
+                              shaderCallback: (bounds) => const LinearGradient(
+                                colors: [_kPurple, _kViolet, _kCyan],
+                                begin: Alignment.centerLeft,
+                                end: Alignment.centerRight,
+                              ).createShader(bounds),
+                              child: Text(
+                                'SintonIA',
+                                style: GoogleFonts.nunitoSans(
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.w800,
+                                  color: Colors.white,
+                                  letterSpacing: 0.5,
                                 ),
                               ),
                             ),
-                            const SizedBox(height: 16),
-                            Text(
-                              'SintonIA',
-                              style: GoogleFonts.nunitoSans(
-                                fontSize: 28,
-                                fontWeight: FontWeight.w800,
-                                color: AppTheme.primary,
-                                letterSpacing: -0.5,
-                              ),
-                            ),
-                            const SizedBox(height: 6),
+                            const SizedBox(height: 4),
                             Text(
                               'Seu espaço seguro de conexões',
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
+                              style: GoogleFonts.nunitoSans(
+                                fontSize: 13,
+                                color: _kHint,
+                                fontWeight: FontWeight.w400,
                               ),
                             ),
                           ],
                         ),
                       ),
-                      const SizedBox(height: 44),
+                      const SizedBox(height: 40),
+                      // ── Welcome text ──────────────────────────────────
                       Text(
                         'Bem-vindo de volta 👋',
+                        textAlign: TextAlign.center,
                         style: GoogleFonts.nunitoSans(
                           fontSize: 22,
                           fontWeight: FontWeight.w800,
-                          color: theme.colorScheme.onSurface,
+                          color: Colors.white,
                           letterSpacing: -0.3,
                         ),
                       ),
                       const SizedBox(height: 6),
                       Text(
                         'Entre para continuar sua jornada',
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.nunitoSans(
+                          fontSize: 14,
+                          color: _kHint,
                         ),
                       ),
                       const SizedBox(height: 28),
+                      // ── Form ──────────────────────────────────────────
                       Form(
                         key: _formKey,
                         child: Column(
                           children: [
-                            _buildEmailField(theme),
+                            _buildEmailField(),
                             const SizedBox(height: 16),
-                            _buildPasswordField(theme),
+                            _buildPasswordField(),
                             if (_errorMessage != null) ...[
                               const SizedBox(height: 12),
                               Container(
                                 padding: const EdgeInsets.all(12),
                                 decoration: BoxDecoration(
-                                  color: AppTheme.error.withAlpha(15),
+                                  color: Colors.red.withAlpha(26),
                                   borderRadius: BorderRadius.circular(12),
                                   border: Border.all(
-                                    color: AppTheme.error.withAlpha(60),
+                                    color: Colors.red.withAlpha(102),
                                   ),
                                 ),
                                 child: Row(
                                   children: [
                                     const Icon(
                                       Icons.error_outline_rounded,
-                                      color: AppTheme.error,
+                                      color: Colors.redAccent,
                                       size: 18,
                                     ),
                                     const SizedBox(width: 8),
                                     Expanded(
                                       child: Text(
                                         _errorMessage!,
-                                        style: theme.textTheme.bodySmall
-                                            ?.copyWith(color: AppTheme.error),
+                                        style: GoogleFonts.nunitoSans(
+                                          color: Colors.redAccent,
+                                          fontSize: 13,
+                                        ),
                                       ),
                                     ),
                                   ],
@@ -235,7 +397,14 @@ class _LoginScreenState extends State<LoginScreen>
                             Align(
                               alignment: Alignment.centerRight,
                               child: TextButton(
-                                onPressed: () {},
+                                onPressed: () {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) =>
+                                          const ForgotPasswordScreen(),
+                                    ),
+                                  );
+                                },
                                 style: TextButton.styleFrom(
                                   padding: const EdgeInsets.symmetric(
                                     horizontal: 4,
@@ -245,7 +414,7 @@ class _LoginScreenState extends State<LoginScreen>
                                 child: Text(
                                   'Esqueci minha senha',
                                   style: GoogleFonts.nunitoSans(
-                                    color: const Color(0xFF3B9B88),
+                                    color: _kCyan,
                                     fontSize: 13,
                                     fontWeight: FontWeight.w600,
                                   ),
@@ -253,14 +422,15 @@ class _LoginScreenState extends State<LoginScreen>
                               ),
                             ),
                             const SizedBox(height: 20),
-                            _buildLoginButton(theme),
+                            _buildLoginButton(),
+                            const SizedBox(height: 20),
                           ],
                         ),
                       ),
                       const SizedBox(height: 28),
-                      _buildDivider(theme),
+                      _buildDivider(),
                       const SizedBox(height: 24),
-                      _buildRegisterRow(theme),
+                      _buildRegisterRow(),
                       const SizedBox(height: 36),
                     ],
                   ),
@@ -273,159 +443,134 @@ class _LoginScreenState extends State<LoginScreen>
     );
   }
 
-  Widget _buildEmailField(ThemeData theme) {
-    return Container(
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withAlpha(12),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: TextFormField(
-        controller: _emailCtrl,
-        keyboardType: TextInputType.emailAddress,
-        textInputAction: TextInputAction.next,
-        style: theme.textTheme.bodyLarge,
-        decoration: InputDecoration(
-          labelText: 'E-mail',
-          hintText: 'seu@email.com',
-          prefixIcon: const Icon(Icons.email_outlined, size: 20),
-          filled: true,
-          fillColor: theme.colorScheme.surface,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: BorderSide.none,
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: BorderSide.none,
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: const BorderSide(color: AppTheme.primary, width: 2),
-          ),
-          errorBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: const BorderSide(color: AppTheme.error),
-          ),
-          focusedErrorBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: const BorderSide(color: AppTheme.error, width: 2),
-          ),
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 18,
-          ),
+  Widget _buildEmailField() {
+    return TextFormField(
+      controller: _emailCtrl,
+      keyboardType: TextInputType.emailAddress,
+      textInputAction: TextInputAction.next,
+      style: GoogleFonts.nunitoSans(color: Colors.white, fontSize: 15),
+      decoration: InputDecoration(
+        labelText: 'E-mail',
+        labelStyle: GoogleFonts.nunitoSans(color: _kHint, fontSize: 14),
+        hintText: 'seu@email.com',
+        hintStyle: GoogleFonts.nunitoSans(color: _kHint.withAlpha(153)),
+        prefixIcon: const Icon(Icons.email_outlined, size: 20, color: _kHint),
+        filled: true,
+        fillColor: _kFieldBg,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: BorderSide(color: _kViolet.withAlpha(77)),
         ),
-        validator: (v) {
-          if (v == null || v.trim().isEmpty) return 'Informe seu e-mail';
-          final emailRegex = RegExp(
-            r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$',
-          );
-          if (!emailRegex.hasMatch(v.trim())) return 'E-mail inválido';
-          return null;
-        },
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: BorderSide(color: _kViolet.withAlpha(77)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: const BorderSide(color: _kCyan, width: 1.5),
+        ),
+        errorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: const BorderSide(color: Colors.redAccent),
+        ),
+        focusedErrorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: const BorderSide(color: Colors.redAccent, width: 1.5),
+        ),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 18,
+        ),
       ),
+      validator: (v) {
+        if (v == null || v.trim().isEmpty) return 'Informe seu e-mail';
+        final emailRegex = RegExp(
+          r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$',
+        );
+        if (!emailRegex.hasMatch(v.trim())) return 'E-mail inválido';
+        return null;
+      },
     );
   }
 
-  Widget _buildPasswordField(ThemeData theme) {
-    return Container(
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withAlpha(12),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: TextFormField(
-        controller: _passwordCtrl,
-        obscureText: _obscurePassword,
-        textInputAction: TextInputAction.done,
-        onFieldSubmitted: (_) => _login(),
-        style: theme.textTheme.bodyLarge,
-        decoration: InputDecoration(
-          labelText: 'Senha',
-          hintText: '••••••••',
-          prefixIcon: const Icon(Icons.lock_outlined, size: 20),
-          suffixIcon: IconButton(
-            onPressed: () =>
-                setState(() => _obscurePassword = !_obscurePassword),
-            icon: Icon(
-              _obscurePassword
-                  ? Icons.visibility_outlined
-                  : Icons.visibility_off_outlined,
-              size: 20,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          ),
-          filled: true,
-          fillColor: theme.colorScheme.surface,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: BorderSide.none,
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: BorderSide.none,
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: const BorderSide(color: AppTheme.primary, width: 2),
-          ),
-          errorBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: const BorderSide(color: AppTheme.error),
-          ),
-          focusedErrorBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: const BorderSide(color: AppTheme.error, width: 2),
-          ),
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 18,
+  Widget _buildPasswordField() {
+    return TextFormField(
+      controller: _passwordCtrl,
+      obscureText: _obscurePassword,
+      textInputAction: TextInputAction.done,
+      onFieldSubmitted: (_) => _login(),
+      style: GoogleFonts.nunitoSans(color: Colors.white, fontSize: 15),
+      decoration: InputDecoration(
+        labelText: 'Senha',
+        labelStyle: GoogleFonts.nunitoSans(color: _kHint, fontSize: 14),
+        hintText: '••••••••',
+        hintStyle: GoogleFonts.nunitoSans(color: _kHint.withAlpha(153)),
+        prefixIcon: const Icon(Icons.lock_outlined, size: 20, color: _kHint),
+        suffixIcon: IconButton(
+          onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+          icon: Icon(
+            _obscurePassword
+                ? Icons.visibility_outlined
+                : Icons.visibility_off_outlined,
+            size: 20,
+            color: _kHint,
           ),
         ),
-        validator: (v) {
-          if (v == null || v.isEmpty) return 'Informe sua senha';
-          if (v.length < 6) return 'Senha muito curta';
-          return null;
-        },
+        filled: true,
+        fillColor: _kFieldBg,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: BorderSide(color: _kViolet.withAlpha(77)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: BorderSide(color: _kViolet.withAlpha(77)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: const BorderSide(color: _kPurple, width: 1.5),
+        ),
+        errorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: const BorderSide(color: Colors.redAccent),
+        ),
+        focusedErrorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: const BorderSide(color: Colors.redAccent, width: 1.5),
+        ),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 18,
+        ),
       ),
+      validator: (v) {
+        if (v == null || v.isEmpty) return 'Informe sua senha';
+        if (v.length < 6) return 'Senha muito curta';
+        return null;
+      },
     );
   }
 
-  Widget _buildLoginButton(ThemeData theme) {
+  Widget _buildLoginButton() {
     return SizedBox(
       width: double.infinity,
       height: 54,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
+      child: DecoratedBox(
         decoration: BoxDecoration(
           gradient: LinearGradient(
             colors: _isLoading
-                ? [
-                    AppTheme.primary.withAlpha(160),
-                    AppTheme.primaryLight.withAlpha(160),
-                  ]
-                : [AppTheme.primary, AppTheme.primaryLight],
+                ? [_kPurple.withAlpha(128), _kCyan.withAlpha(128)]
+                : [_kPurple, _kViolet, _kCyan],
             begin: Alignment.centerLeft,
             end: Alignment.centerRight,
           ),
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(30),
           boxShadow: _isLoading
               ? []
               : [
                   BoxShadow(
-                    color: AppTheme.primary.withAlpha(80),
-                    blurRadius: 16,
+                    color: _kPurple.withAlpha(115),
+                    blurRadius: 20,
                     offset: const Offset(0, 6),
                   ),
                 ],
@@ -434,7 +579,7 @@ class _LoginScreenState extends State<LoginScreen>
           color: Colors.transparent,
           child: InkWell(
             onTap: _isLoading ? null : _login,
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(30),
             child: Center(
               child: _isLoading
                   ? const SizedBox(
@@ -451,7 +596,7 @@ class _LoginScreenState extends State<LoginScreen>
                         color: Colors.white,
                         fontSize: 16,
                         fontWeight: FontWeight.w700,
-                        letterSpacing: 0.2,
+                        letterSpacing: 0.4,
                       ),
                     ),
             ),
@@ -461,38 +606,34 @@ class _LoginScreenState extends State<LoginScreen>
     );
   }
 
-  Widget _buildDivider(ThemeData theme) {
+  Widget _buildDivider() {
     return Row(
       children: [
-        Expanded(child: Divider(color: theme.colorScheme.outlineVariant)),
+        Expanded(child: Divider(color: Colors.white.withAlpha(31))),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Text(
             'ou',
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
+            style: GoogleFonts.nunitoSans(color: _kHint, fontSize: 13),
           ),
         ),
-        Expanded(child: Divider(color: theme.colorScheme.outlineVariant)),
+        Expanded(child: Divider(color: Colors.white.withAlpha(31))),
       ],
     );
   }
 
-  Widget _buildRegisterRow(ThemeData theme) {
+  Widget _buildRegisterRow() {
     return Center(
       child: RichText(
         textAlign: TextAlign.center,
         text: TextSpan(
-          style: theme.textTheme.bodyMedium?.copyWith(
-            color: theme.colorScheme.onSurfaceVariant,
-          ),
+          style: GoogleFonts.nunitoSans(color: _kHint, fontSize: 14),
           children: [
             const TextSpan(text: 'Não tem uma conta? '),
             TextSpan(
               text: 'Criar conta',
               style: GoogleFonts.nunitoSans(
-                color: const Color(0xFF3B9B88),
+                color: _kCyan,
                 fontWeight: FontWeight.w700,
                 fontSize: 14,
               ),

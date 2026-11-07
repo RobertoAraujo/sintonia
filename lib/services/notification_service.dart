@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import './supabase_service.dart';
+import './user_settings_service.dart';
 
 // ─── Notification Model ───────────────────────────────────────────────────────
 
@@ -10,7 +11,9 @@ enum NotificationType {
   comment,
   friendRequest,
   friendAccepted,
-  message;
+  message,
+  postEdit,
+  report;
 
   static NotificationType fromString(String value) {
     switch (value) {
@@ -24,6 +27,10 @@ enum NotificationType {
         return NotificationType.friendAccepted;
       case 'message':
         return NotificationType.message;
+      case 'post_edit':
+        return NotificationType.postEdit;
+      case 'report':
+        return NotificationType.report;
       default:
         return NotificationType.like;
     }
@@ -110,9 +117,31 @@ class NotificationService extends ChangeNotifier {
   bool _isLoading = false;
   String? _error;
 
+  // Cached notification settings
+  bool _notifMessages = true;
+  bool _notifFriends = true;
+  bool _notifFeed = true;
+  bool _notifAI = false;
+
   List<AppNotification> get notifications => List.unmodifiable(_notifications);
 
   int get unreadCount => _notifications.where((n) => !n.isRead).length;
+
+  /// Unread count for the bell icon — excludes private messages (those are counted separately in the Chat tab badge)
+  /// Only counts notifications within the last 30 minutes to match the list filter.
+  int get socialUnreadCount {
+    final thirtyMinutesAgo = DateTime.now().subtract(
+      const Duration(minutes: 30),
+    );
+    return _notifications
+        .where(
+          (n) =>
+              !n.isRead &&
+              n.type != NotificationType.message &&
+              n.createdAt.isAfter(thirtyMinutesAgo),
+        )
+        .length;
+  }
 
   bool get isLoading => _isLoading;
   String? get error => _error;
@@ -130,29 +159,61 @@ class NotificationService extends ChangeNotifier {
     _error = null;
     notifyListeners();
 
+    // Load notification preferences
     try {
+      final settings = await UserSettingsService.instance.fetchSettings();
+      _notifMessages = settings['notify_messages'] ?? true;
+      _notifFriends = settings['notify_friendships'] ?? true;
+      _notifFeed = settings['notify_feed'] ?? true;
+      _notifAI = settings['notify_ai_suggestions'] ?? false;
+    } catch (_) {}
+
+    try {
+      final thirtyMinutesAgo = DateTime.now()
+          .subtract(const Duration(minutes: 30))
+          .toUtc()
+          .toIso8601String();
+
       final data = await _client
           .from('notifications')
           .select(
             '*, actor:user_profiles!actor_id(full_name, username, avatar_url)',
           )
           .eq('recipient_id', uid)
+          .gte('created_at', thirtyMinutesAgo)
           .order('created_at', ascending: false)
           .limit(50);
 
+      final all = (data as List<dynamic>)
+          .map((e) => AppNotification.fromJson(e as Map<String, dynamic>))
+          .toList();
+
       _notifications
         ..clear()
-        ..addAll(
-          (data as List<dynamic>)
-              .map((e) => AppNotification.fromJson(e as Map<String, dynamic>))
-              .toList(),
-        );
+        ..addAll(all.where(_isNotificationAllowed).toList());
     } catch (e) {
       _error = e.toString();
       debugPrint('NotificationService.fetchNotifications error: $e');
     } finally {
       _isLoading = false;
       notifyListeners();
+    }
+  }
+
+  /// Returns true if the notification should be shown based on user settings.
+  bool _isNotificationAllowed(AppNotification n) {
+    switch (n.type) {
+      case NotificationType.message:
+        return _notifMessages;
+      case NotificationType.friendRequest:
+      case NotificationType.friendAccepted:
+        return _notifFriends;
+      case NotificationType.like:
+      case NotificationType.comment:
+      case NotificationType.postEdit:
+        return _notifFeed;
+      case NotificationType.report:
+        return true; // always show moderation notifications
     }
   }
 
@@ -186,11 +247,12 @@ class NotificationService extends ChangeNotifier {
                   .eq('id', payload.newRecord['id'] as String)
                   .maybeSingle();
               if (row != null) {
-                _notifications.insert(
-                  0,
-                  AppNotification.fromJson(row),
-                );
-                notifyListeners();
+                final notification = AppNotification.fromJson(row);
+                // Only add if allowed by user settings
+                if (_isNotificationAllowed(notification)) {
+                  _notifications.insert(0, notification);
+                  notifyListeners();
+                }
               }
             } catch (e) {
               debugPrint('NotificationService realtime fetch error: $e');

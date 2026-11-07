@@ -4,8 +4,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
+import 'package:supabase_flutter/supabase_flutter.dart';
+
 import '../../../services/avatar_notifier.dart';
-import '../../../services/media_permission_service.dart';
+import '../../../services/pet_avatar_notifier.dart';
+import '../../../services/pet_service.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 
@@ -22,8 +25,8 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
 
   final TextEditingController _nameController = TextEditingController();
   final TextEditingController _petNameController = TextEditingController();
-  final TextEditingController _petBreedController = TextEditingController();
-  final TextEditingController _petRoleController = TextEditingController();
+  final TextEditingController _petSpeciesBreedController =
+      TextEditingController();
 
   bool _isLoading = true;
   bool _isSaving = false;
@@ -33,6 +36,15 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
   String _currentAvatarUrl = '';
   String _currentPetPhotoUrl = '';
   String _petId = '';
+
+  // Role dropdown — maps display label → DB enum value
+  static const Map<String, String> _roleOptions = {
+    'Pet': 'pet',
+    'Suporte Emocional': 'suporte_emocional',
+    'Cão de Assistência': 'cao_assistencia',
+    'Animal de Terapia': 'animal_terapia',
+  };
+  String _selectedRoleKey = 'Pet'; // display label
 
   XFile? _userImageFile;
   XFile? _petImageFile;
@@ -47,8 +59,7 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
   void dispose() {
     _nameController.dispose();
     _petNameController.dispose();
-    _petBreedController.dispose();
-    _petRoleController.dispose();
+    _petSpeciesBreedController.dispose();
     super.dispose();
   }
 
@@ -68,9 +79,20 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
           final pet = pets.first;
           _petId = pet['id'] ?? '';
           _petNameController.text = pet['name'] ?? '';
-          _petBreedController.text =
-              '${pet['species'] ?? ''}${(pet['breed'] as String?)?.isNotEmpty == true ? ' - ${pet['breed']}' : ''}';
-          _petRoleController.text = pet['role'] ?? '';
+          // Combine species + breed into one field
+          final species = (pet['species'] as String?) ?? '';
+          final breed = (pet['breed'] as String?) ?? '';
+          _petSpeciesBreedController.text = breed.isNotEmpty
+              ? '$species - $breed'
+              : species;
+          // Map DB enum value back to display label
+          final dbRole = (pet['role'] as String?) ?? 'pet';
+          _selectedRoleKey = _roleOptions.entries
+              .firstWhere(
+                (e) => e.value == dbRole,
+                orElse: () => _roleOptions.entries.first,
+              )
+              .key;
           _currentPetPhotoUrl = pet['photo_url'] ?? '';
         }
       }
@@ -79,19 +101,16 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
   }
 
   Future<void> _pickUserImage() async {
-    if (!await MediaPermissionService.request(camera: false)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Permissão para acessar fotos negada.')),
-        );
-      }
-      return;
-    }
     final XFile? image = await _picker.pickImage(
       source: ImageSource.gallery,
       imageQuality: 80,
     );
-    if (image == null || !mounted) return;
+    if (image == null) {
+      // Force a rebuild to recover from black screen after picker dismissal
+      if (mounted) setState(() {});
+      return;
+    }
+    if (!mounted) return;
     setState(() {
       _userImageFile = image;
       _isUploadingAvatar = true;
@@ -130,19 +149,16 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
   }
 
   Future<void> _pickPetImage() async {
-    if (!await MediaPermissionService.request(camera: false)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Permissão para acessar fotos negada.')),
-        );
-      }
-      return;
-    }
     final XFile? image = await _picker.pickImage(
       source: ImageSource.gallery,
       imageQuality: 80,
     );
-    if (image == null || !mounted) return;
+    if (image == null) {
+      // Force a rebuild to recover from black screen after picker dismissal
+      if (mounted) setState(() {});
+      return;
+    }
+    if (!mounted) return;
     setState(() {
       _petImageFile = image;
       _isUploadingPet = true;
@@ -150,19 +166,30 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
     try {
       final bytes = await image.readAsBytes();
       final ext = image.name.split('.').last.toLowerCase();
-      final url = await SupabaseService.instance.uploadPetPhoto(bytes, ext);
+      final safeExt = ['jpg', 'jpeg', 'png', 'webp'].contains(ext)
+          ? ext
+          : 'jpg';
+
+      String? url;
+
+      if (_petId.isNotEmpty) {
+        // Use PetService which uploads to 'pets' bucket and syncs DB
+        url = await PetService.instance.uploadAndSyncPetPhoto(
+          petId: _petId,
+          imageBytes: bytes,
+          fileExtension: safeExt,
+        );
+      } else {
+        // No pet yet — upload to pets bucket without DB sync (will be saved on _save)
+        url = await _uploadPetPhotoToBucket(bytes, safeExt);
+      }
+
       if (url != null && mounted) {
         setState(() {
-          _currentPetPhotoUrl = url;
+          _currentPetPhotoUrl = url!;
           _isUploadingPet = false;
         });
-        // Persist pet photo url if pet exists
-        if (_petId.isNotEmpty) {
-          await SupabaseService.instance.updatePet(_petId, {
-            'photo_url': url,
-            'photo_semantic': 'Foto do pet ${_petNameController.text}',
-          });
-        }
+        PetAvatarNotifier.instance.updatePetAvatar(url);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -183,6 +210,39 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
     }
   }
 
+  /// Uploads pet photo to the 'pets' bucket without updating DB (used when pet doesn't exist yet).
+  Future<String?> _uploadPetPhotoToBucket(
+    List<int> imageBytes,
+    String fileExtension,
+  ) async {
+    final uid = SupabaseService.instance.currentUserId;
+    if (uid == null) return null;
+    try {
+      final safeExt = ['jpg', 'jpeg', 'png', 'webp'].contains(fileExtension)
+          ? fileExtension
+          : 'jpg';
+      final storagePath =
+          '$uid/pet_${DateTime.now().millisecondsSinceEpoch}.$safeExt';
+      final mimeType = (safeExt == 'jpg' || safeExt == 'jpeg')
+          ? 'image/jpeg'
+          : 'image/$safeExt';
+      await SupabaseService.instance.client.storage
+          .from('pets')
+          .uploadBinary(
+            storagePath,
+            Uint8List.fromList(imageBytes),
+            fileOptions: FileOptions(contentType: mimeType, upsert: true),
+          );
+      final baseUrl = SupabaseService.instance.client.storage
+          .from('pets')
+          .getPublicUrl(storagePath);
+      return '$baseUrl?v=${DateTime.now().millisecondsSinceEpoch}';
+    } catch (e) {
+      debugPrint('_uploadPetPhotoToBucket error: $e');
+      return null;
+    }
+  }
+
   Future<void> _save() async {
     final name = _nameController.text.trim();
     if (name.isEmpty) {
@@ -199,23 +259,51 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
       return;
     }
     setState(() => _isSaving = true);
+
+    // 1. Save user profile name
     final profileSuccess = await SupabaseService.instance.updateUserProfile({
       'full_name': name,
     });
 
-    // Update pet data if pet exists
+    // 2. Parse species / breed from combined field
+    final speciesBreedText = _petSpeciesBreedController.text.trim();
+    final parts = speciesBreedText.split(' - ');
+    final species = parts.isNotEmpty ? parts.first.trim() : '';
+    final breed = parts.length > 1 ? parts.sublist(1).join(' - ').trim() : '';
+
+    // 3. Map selected role label to DB enum value
+    final roleDbValue = _roleOptions[_selectedRoleKey] ?? 'pet';
+
+    final petName = _petNameController.text.trim();
+
     if (_petId.isNotEmpty) {
-      final breedParts = _petBreedController.text.trim().split(' - ');
-      final species = breedParts.isNotEmpty ? breedParts.first.trim() : '';
-      final breed = breedParts.length > 1
-          ? breedParts.sublist(1).join(' - ').trim()
-          : '';
+      // Update existing pet
       await SupabaseService.instance.updatePet(_petId, {
-        'name': _petNameController.text.trim(),
+        'name': petName,
         'species': species,
         'breed': breed,
-        'role': _petRoleController.text.trim(),
+        'role': roleDbValue,
+        if (_currentPetPhotoUrl.isNotEmpty) 'photo_url': _currentPetPhotoUrl,
+        'photo_semantic': 'Foto do pet $petName',
       });
+    } else if (petName.isNotEmpty) {
+      // Create new pet if name was provided
+      final newPet = await SupabaseService.instance.createPet(
+        name: petName,
+        species: species.isNotEmpty ? species : 'Não informado',
+        breed: breed,
+        role: roleDbValue,
+        photoUrl: _currentPetPhotoUrl,
+        photoSemantic: 'Foto do pet $petName',
+      );
+      if (newPet != null) {
+        final newPetId = newPet['id'] as String?;
+        if (newPetId != null) {
+          _petId = newPetId;
+          // Set as active pet
+          await SupabaseService.instance.setActivePet(newPetId);
+        }
+      }
     }
 
     if (!mounted) return;
@@ -298,6 +386,7 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
   }
 
   void _showPetImageZoom() {
+    if (_petImageFile == null && _currentPetPhotoUrl.isEmpty) return;
     showDialog(
       context: context,
       builder: (BuildContext context) {
@@ -361,7 +450,7 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
                           ),
                         ),
                         Text(
-                          "${_petBreedController.text} • ${_petRoleController.text}",
+                          '${_petSpeciesBreedController.text} • $_selectedRoleKey',
                           style: const TextStyle(
                             color: Colors.white70,
                             fontSize: 13,
@@ -574,16 +663,47 @@ class _EditProfileAndFeedScreenState extends State<EditProfileAndFeedScreen> {
                           const SizedBox(height: 10),
                           _buildTextField(
                             theme,
-                            controller: _petBreedController,
+                            controller: _petSpeciesBreedController,
                             label: "Espécie / Raça",
                             icon: Icons.category_outlined,
                           ),
                           const SizedBox(height: 10),
-                          _buildTextField(
-                            theme,
-                            controller: _petRoleController,
-                            label: "Função (ex: Suporte Emocional)",
-                            icon: Icons.favorite_outline_rounded,
+                          // Role dropdown
+                          DropdownButtonFormField<String>(
+                            initialValue: _selectedRoleKey,
+                            decoration: InputDecoration(
+                              labelText: 'Função',
+                              prefixIcon: const Icon(
+                                Icons.favorite_outline_rounded,
+                              ),
+                              filled: true,
+                              fillColor:
+                                  theme.colorScheme.surfaceContainerHighest,
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                borderSide: BorderSide.none,
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                borderSide: const BorderSide(
+                                  color: AppTheme.primary,
+                                  width: 1.5,
+                                ),
+                              ),
+                            ),
+                            items: _roleOptions.keys
+                                .map(
+                                  (label) => DropdownMenuItem(
+                                    value: label,
+                                    child: Text(label),
+                                  ),
+                                )
+                                .toList(),
+                            onChanged: (val) {
+                              if (val != null) {
+                                setState(() => _selectedRoleKey = val);
+                              }
+                            },
                           ),
                         ],
                       ),

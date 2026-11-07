@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../../../core/app_export.dart';
 import '../../../services/supabase_service.dart';
@@ -24,6 +25,8 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   late TextEditingController _petNameCtrl;
   late TextEditingController _usernameCtrl;
   bool _isSaving = false;
+  bool _isUploadingAvatar = false;
+  String? _localAvatarUrl;
 
   @override
   void initState() {
@@ -51,10 +54,79 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
     super.dispose();
   }
 
+  Future<void> _pickAndUploadAvatar() async {
+    try {
+      final picker = ImagePicker();
+      final picked = await picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 80,
+        maxWidth: 800,
+        maxHeight: 800,
+      );
+      if (picked == null) return;
+
+      setState(() => _isUploadingAvatar = true);
+
+      final bytes = await picked.readAsBytes();
+      final ext = picked.name.split('.').last.toLowerCase();
+      final safeExt = ['jpg', 'jpeg', 'png', 'webp'].contains(ext)
+          ? ext
+          : 'jpg';
+
+      final url = await SupabaseService.instance.uploadProfileAvatar(
+        bytes,
+        safeExt,
+      );
+
+      if (!mounted) return;
+      if (url != null) {
+        setState(() {
+          _localAvatarUrl = url;
+          _isUploadingAvatar = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Foto atualizada! ✨'),
+            behavior: SnackBarBehavior.floating,
+            backgroundColor: AppTheme.primary,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        );
+      } else {
+        setState(() => _isUploadingAvatar = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Erro ao enviar foto. Tente novamente.'),
+            backgroundColor: AppTheme.error,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isUploadingAvatar = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Não foi possível acessar a galeria.'),
+            backgroundColor: AppTheme.error,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _save() async {
     final name = _nameCtrl.text.trim();
     final username = _usernameCtrl.text.trim();
-    // Basic validation
     if (name.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -71,7 +143,6 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       return;
     }
     setState(() => _isSaving = true);
-    // Persist to Supabase
     final updates = <String, dynamic>{
       'full_name': name,
       'username': username.isNotEmpty
@@ -79,7 +150,6 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
           : null,
       'bio': _bioCtrl.text.trim(),
     };
-    // Remove null values
     updates.removeWhere((_, v) => v == null);
     final success = await SupabaseService.instance.updateUserProfile(updates);
     if (!mounted) return;
@@ -92,6 +162,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
             ? null
             : _petNameCtrl.text.trim(),
         'username': username,
+        if (_localAvatarUrl != null) 'avatarUrl': _localAvatarUrl,
       });
       Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -121,6 +192,8 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final currentAvatarUrl =
+        _localAvatarUrl ?? (widget.profileData['avatarUrl'] as String? ?? '');
 
     return Scaffold(
       backgroundColor: theme.scaffoldBackgroundColor,
@@ -158,30 +231,49 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
             Center(
               child: Stack(
                 children: [
-                  CircleAvatar(
-                    radius: 52,
-                    backgroundImage: NetworkImage(
-                      widget.profileData['avatarUrl'] as String? ?? '',
-                    ),
-                  ),
+                  _isUploadingAvatar
+                      ? CircleAvatar(
+                          radius: 52,
+                          backgroundColor:
+                              theme.colorScheme.surfaceContainerHighest,
+                          child: const CircularProgressIndicator(),
+                        )
+                      : CircleAvatar(
+                          radius: 52,
+                          backgroundColor:
+                              theme.colorScheme.surfaceContainerHighest,
+                          backgroundImage: currentAvatarUrl.isNotEmpty
+                              ? NetworkImage(currentAvatarUrl)
+                              : null,
+                          child: currentAvatarUrl.isEmpty
+                              ? Icon(
+                                  Icons.person_rounded,
+                                  size: 48,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                )
+                              : null,
+                        ),
                   Positioned(
                     right: 0,
                     bottom: 0,
-                    child: Container(
-                      width: 32,
-                      height: 32,
-                      decoration: BoxDecoration(
-                        color: AppTheme.primary,
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: theme.colorScheme.surface,
-                          width: 2,
+                    child: GestureDetector(
+                      onTap: _isUploadingAvatar ? null : _pickAndUploadAvatar,
+                      child: Container(
+                        width: 32,
+                        height: 32,
+                        decoration: BoxDecoration(
+                          color: AppTheme.primary,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: theme.colorScheme.surface,
+                            width: 2,
+                          ),
                         ),
-                      ),
-                      child: const Icon(
-                        Icons.camera_alt_rounded,
-                        size: 16,
-                        color: Colors.white,
+                        child: const Icon(
+                          Icons.camera_alt_rounded,
+                          size: 16,
+                          color: Colors.white,
+                        ),
                       ),
                     ),
                   ),
@@ -191,7 +283,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
             const SizedBox(height: 8),
             Center(
               child: TextButton(
-                onPressed: () {},
+                onPressed: _isUploadingAvatar ? null : _pickAndUploadAvatar,
                 child: const Text(
                   'Alterar foto de perfil',
                   style: TextStyle(color: AppTheme.primary),
@@ -228,7 +320,6 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
             _SectionLabel('Meu Pet'),
             const SizedBox(height: 12),
 
-            // Pet avatar
             Row(
               children: [
                 if (widget.profileData['petAvatarUrl'] != null)

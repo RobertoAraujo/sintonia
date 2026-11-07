@@ -1,5 +1,4 @@
-import 'dart:isolate' if (dart.library.html) 'dart:async';
-import 'dart:isolate' as isolate_lib;
+import 'dart:isolate' as native_isolate;
 import 'package:flutter/foundation.dart';
 import '../models/user_profile.dart';
 import '../models/profile_match_result.dart';
@@ -99,7 +98,7 @@ class RecommendationEngineService {
       limit: limit,
     );
 
-    return await isolate_lib.Isolate.run(() => _computeInIsolate(payload));
+    return await native_isolate.Isolate.run(() => _computeInIsolate(payload));
   }
 
   // ─────────────────────────────────────────────────────────────────────────

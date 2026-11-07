@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../../../services/pet_avatar_notifier.dart';
+import '../../../services/pet_service.dart';
 import '../../../services/profile_interaction_service.dart';
 import '../../../theme/app_theme.dart';
-import '../../../widgets/custom_image_widget.dart';
 
 /// Bottom-sheet modal for creating or editing a pet profile.
-/// Supports: photo URL, name, species, breed, age, and role.
+/// Supports: photo upload (gallery), name, species, breed, age, and role.
 class EditPetModal extends StatefulWidget {
   final Map<String, dynamic>? existingPet;
   final String userId;
@@ -47,9 +48,12 @@ class _EditPetModalState extends State<EditPetModal> {
   late final TextEditingController _speciesCtrl;
   late final TextEditingController _breedCtrl;
   late final TextEditingController _ageCtrl;
-  late final TextEditingController _photoCtrl;
   String _selectedRole = 'pet';
   bool _isSaving = false;
+  bool _isUploadingPhoto = false;
+
+  // Current pet photo URL (may be updated after upload)
+  String _currentPhotoUrl = '';
 
   static const List<Map<String, String>> _roles = [
     {'value': 'pet', 'label': 'Pet de Estimação 🐾'},
@@ -66,7 +70,7 @@ class _EditPetModalState extends State<EditPetModal> {
     _speciesCtrl = TextEditingController(text: p?['species'] as String? ?? '');
     _breedCtrl = TextEditingController(text: p?['breed'] as String? ?? '');
     _ageCtrl = TextEditingController(text: p?['age'] as String? ?? '');
-    _photoCtrl = TextEditingController(text: p?['imageUrl'] as String? ?? '');
+    _currentPhotoUrl = p?['imageUrl'] as String? ?? '';
     _selectedRole = p?['role'] as String? ?? 'pet';
   }
 
@@ -76,8 +80,83 @@ class _EditPetModalState extends State<EditPetModal> {
     _speciesCtrl.dispose();
     _breedCtrl.dispose();
     _ageCtrl.dispose();
-    _photoCtrl.dispose();
     super.dispose();
+  }
+
+  /// Pick image from gallery and upload to Supabase Storage (pets bucket).
+  /// Updates pets.photo_url and notifies PetAvatarNotifier.
+  Future<void> _pickAndUploadPetImage() async {
+    final petId = widget.existingPet?['id'] as String? ?? '';
+
+    // For new pets (no ID yet), just pick and store locally until save
+    if (petId.isEmpty) {
+      final picker = ImagePicker();
+      final pickedFile = await picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 85,
+      );
+      if (pickedFile == null) return;
+
+      // We'll upload after the pet is created; for now show a local preview
+      // by storing the path as a temporary indicator
+      setState(() {
+        _currentPhotoUrl = pickedFile.path;
+      });
+      return;
+    }
+
+    final picker = ImagePicker();
+    final pickedFile = await picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 85,
+    );
+    if (pickedFile == null) return;
+
+    setState(() => _isUploadingPhoto = true);
+
+    try {
+      final fileBytes = await pickedFile.readAsBytes();
+      final fileExt = pickedFile.name.split('.').last.toLowerCase();
+
+      final newUrl = await PetService.instance.uploadAndSyncPetPhoto(
+        petId: petId,
+        imageBytes: fileBytes,
+        fileExtension: fileExt,
+      );
+
+      if (newUrl != null && mounted) {
+        setState(() {
+          _currentPhotoUrl = newUrl;
+          _isUploadingPhoto = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Foto do pet atualizada com sucesso! 🐾'),
+            backgroundColor: Color(0xFF1B4D3E),
+          ),
+        );
+      } else {
+        if (mounted) {
+          setState(() => _isUploadingPhoto = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Erro ao atualizar foto do pet.'),
+              backgroundColor: Colors.redAccent,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isUploadingPhoto = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Erro ao atualizar foto do pet.'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _save() async {
@@ -94,7 +173,7 @@ class _EditPetModalState extends State<EditPetModal> {
         'breed': _breedCtrl.text.trim(),
         'age': _ageCtrl.text.trim(),
         'role': _selectedRole,
-        'photo_url': _photoCtrl.text.trim(),
+        'photo_url': _currentPhotoUrl,
       },
     );
 
@@ -114,7 +193,6 @@ class _EditPetModalState extends State<EditPetModal> {
     );
 
     if (result.status == 'success') {
-      // Build the updated pet map for the parent to consume.
       final updatedPet = <String, dynamic>{
         'id': result.updatedFields['pet_id'] ?? widget.existingPet?['id'] ?? '',
         'name': _nameCtrl.text.trim(),
@@ -122,8 +200,8 @@ class _EditPetModalState extends State<EditPetModal> {
         'breed': _breedCtrl.text.trim(),
         'age': _ageCtrl.text.trim(),
         'role': _selectedRole,
-        'imageUrl': _photoCtrl.text.trim().isNotEmpty
-            ? _photoCtrl.text.trim()
+        'imageUrl': _currentPhotoUrl.isNotEmpty
+            ? _currentPhotoUrl
             : (widget.existingPet?['imageUrl'] ?? ''),
         'imageSemantic':
             '${_nameCtrl.text.trim()}, ${_speciesCtrl.text.trim()}',
@@ -131,10 +209,8 @@ class _EditPetModalState extends State<EditPetModal> {
         'lastEntry': widget.existingPet?['lastEntry'] ?? '',
       };
 
-      // Notify global listeners (e.g. ProfileScreen overlay) about the new pet photo.
-      final newPhotoUrl = _photoCtrl.text.trim();
-      if (newPhotoUrl.isNotEmpty) {
-        PetAvatarNotifier.instance.updatePetAvatar(newPhotoUrl);
+      if (_currentPhotoUrl.isNotEmpty) {
+        PetAvatarNotifier.instance.updatePetAvatar(_currentPhotoUrl);
       }
 
       widget.onSaved(updatedPet);
@@ -147,6 +223,7 @@ class _EditPetModalState extends State<EditPetModal> {
     final theme = Theme.of(context);
     final bottomInset = MediaQuery.of(context).viewInsets.bottom;
     final isEditing = widget.existingPet != null;
+    final hasPhoto = _currentPhotoUrl.isNotEmpty;
 
     return Container(
       margin: const EdgeInsets.only(top: 60),
@@ -195,32 +272,99 @@ class _EditPetModalState extends State<EditPetModal> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Pet photo preview
-                    if (_photoCtrl.text.isNotEmpty)
-                      Center(
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(16),
-                          child: CustomImageWidget(
-                            imageUrl: _photoCtrl.text,
-                            width: 100,
-                            height: 100,
-                            fit: BoxFit.cover,
-                            semanticLabel: 'Foto do pet',
+                    // Pet photo section
+                    Center(
+                      child: Stack(
+                        children: [
+                          GestureDetector(
+                            onTap: _isUploadingPhoto
+                                ? null
+                                : _pickAndUploadPetImage,
+                            child: Container(
+                              width: 100,
+                              height: 100,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: const Color(0xFFD7E7E3),
+                                border: Border.all(
+                                  color: AppTheme.primary.withAlpha(77),
+                                  width: 2,
+                                ),
+                              ),
+                              child: ClipOval(
+                                child: _isUploadingPhoto
+                                    ? const Center(
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: Color(0xFF1B4D3E),
+                                        ),
+                                      )
+                                    : hasPhoto
+                                    ? ((_currentPhotoUrl.startsWith('http'))
+                                          ? Image.network(
+                                              _currentPhotoUrl,
+                                              fit: BoxFit.cover,
+                                              errorBuilder: (_, __, ___) =>
+                                                  const Icon(
+                                                    Icons.pets,
+                                                    size: 40,
+                                                    color: Color(0xFF1B4D3E),
+                                                  ),
+                                            )
+                                          : const Icon(
+                                              Icons.pets,
+                                              size: 40,
+                                              color: Color(0xFF1B4D3E),
+                                            ))
+                                    : const Icon(
+                                        Icons.pets,
+                                        size: 40,
+                                        color: Color(0xFF1B4D3E),
+                                      ),
+                              ),
+                            ),
                           ),
+                          // Camera icon overlay
+                          Positioned(
+                            bottom: 0,
+                            right: 0,
+                            child: GestureDetector(
+                              onTap: _isUploadingPhoto
+                                  ? null
+                                  : _pickAndUploadPetImage,
+                              child: Container(
+                                width: 30,
+                                height: 30,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: AppTheme.primary,
+                                  border: Border.all(
+                                    color: Colors.white,
+                                    width: 2,
+                                  ),
+                                ),
+                                child: const Icon(
+                                  Icons.camera_alt_rounded,
+                                  size: 16,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Center(
+                      child: Text(
+                        'Alterar Foto do Pet',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: AppTheme.primary,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
-                    if (_photoCtrl.text.isNotEmpty) const SizedBox(height: 12),
-
-                    // Photo URL field
-                    _buildField(
-                      theme,
-                      controller: _photoCtrl,
-                      label: 'URL da Foto do Pet',
-                      icon: Icons.image_outlined,
-                      hint: 'https://...',
-                      onChanged: (_) => setState(() {}),
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 16),
 
                     // Name
                     _buildField(

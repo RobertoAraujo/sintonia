@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../core/app_export.dart';
 import '../../services/supabase_service.dart';
 import './widgets/admin_actions_log_widget.dart';
+import './widgets/admin_activity_timeline_widget.dart';
 import './widgets/admin_kpi_grid_widget.dart';
 import './widgets/admin_reports_chart_widget.dart';
 import './widgets/admin_reports_queue_widget.dart';
@@ -344,6 +345,9 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                   )
                 : AdminKpiGridWidget(kpis: _kpisMaps),
             const SizedBox(height: 20),
+            // Live Activity Timeline
+            const AdminActivityTimelineWidget(),
+            const SizedBox(height: 20),
             Text(
               'Denúncias por Dia (últimos 7 dias)',
               style: theme.textTheme.titleSmall,
@@ -414,6 +418,9 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                 _isLoadingKpis
                     ? const Center(child: CircularProgressIndicator())
                     : AdminKpiGridWidget(kpis: _kpisMaps),
+                const SizedBox(height: 20),
+                // Live Activity Timeline
+                const AdminActivityTimelineWidget(),
                 const SizedBox(height: 20),
                 Text('Denúncias por Dia', style: theme.textTheme.titleSmall),
                 const SizedBox(height: 12),

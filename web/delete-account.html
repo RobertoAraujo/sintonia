@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Solicitação de Exclusão de Dados – SintonIA</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+      background: #f4f6f9;
+      color: #1a1a2e;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px 48px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+
+    .logo {
+      width: 64px;
+      height: 64px;
+      background: linear-gradient(135deg, #3B9B88, #2d7a6a);
+      border-radius: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 16px;
+      font-size: 28px;
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: #1a1a2e;
+    }
+
+    .subtitle {
+      color: #666;
+      margin-top: 6px;
+      font-size: 0.95rem;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 20px;
+      padding: 32px;
+      max-width: 560px;
+      width: 100%;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+    }
+
+    .warning-box {
+      background: #fff5f5;
+      border: 1px solid #fca5a5;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+
+    .warning-icon { font-size: 20px; flex-shrink: 0; margin-top: 2px; }
+
+    .warning-box p {
+      font-size: 0.88rem;
+      color: #b91c1c;
+      line-height: 1.5;
+    }
+
+    .data-list {
+      list-style: none;
+      margin-bottom: 24px;
+    }
+
+    .data-list li {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 0.9rem;
+      color: #444;
+    }
+
+    .data-list li:last-child { border-bottom: none; }
+    .data-list .dot { width: 8px; height: 8px; background: #ef4444; border-radius: 50%; flex-shrink: 0; }
+
+    label {
+      display: block;
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 6px;
+    }
+
+    input, textarea {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1.5px solid #e0e0e0;
+      border-radius: 12px;
+      font-size: 0.95rem;
+      font-family: inherit;
+      color: #1a1a2e;
+      background: #fafafa;
+      transition: border-color 0.2s;
+      margin-bottom: 16px;
+    }
+
+    input:focus, textarea:focus {
+      outline: none;
+      border-color: #3B9B88;
+      background: #fff;
+    }
+
+    textarea { resize: vertical; min-height: 80px; }
+
+    .checkbox-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 24px;
+    }
+
+    .checkbox-row input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      margin: 0;
+      flex-shrink: 0;
+      accent-color: #ef4444;
+      cursor: pointer;
+    }
+
+    .checkbox-row label {
+      margin: 0;
+      font-size: 0.88rem;
+      color: #555;
+      line-height: 1.5;
+      cursor: pointer;
+    }
+
+    .btn-delete {
+      width: 100%;
+      padding: 14px;
+      background: #ef4444;
+      color: #fff;
+      border: none;
+      border-radius: 12px;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+    }
+
+    .btn-delete:hover { background: #dc2626; }
+    .btn-delete:active { transform: scale(0.98); }
+    .btn-delete:disabled { background: #fca5a5; cursor: not-allowed; }
+
+    .success-box {
+      display: none;
+      background: #f0fdf4;
+      border: 1px solid #86efac;
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+      margin-top: 16px;
+    }
+
+    .success-box h3 { color: #15803d; margin-bottom: 8px; }
+    .success-box p { color: #166534; font-size: 0.9rem; line-height: 1.5; }
+
+    .error-msg {
+      color: #b91c1c;
+      font-size: 0.82rem;
+      margin-top: -10px;
+      margin-bottom: 12px;
+      display: none;
+    }
+
+    footer {
+      margin-top: 32px;
+      text-align: center;
+      font-size: 0.8rem;
+      color: #999;
+    }
+
+    footer a { color: #3B9B88; text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    @media (max-width: 480px) {
+      .card { padding: 24px 20px; }
+      h1 { font-size: 1.3rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="logo">🧠</div>
+    <h1>SintonIA</h1>
+    <p class="subtitle">Solicitação de Exclusão de Dados Pessoais</p>
+  </header>
+
+  <div class="card">
+    <div class="warning-box">
+      <span class="warning-icon">⚠️</span>
+      <p>
+        <strong>Atenção:</strong> Esta ação é <strong>irreversível</strong>. Após a confirmação,
+        todos os seus dados serão permanentemente excluídos e não poderão ser recuperados.
+      </p>
+    </div>
+
+    <p style="font-size:0.9rem; color:#555; margin-bottom:16px; line-height:1.5;">
+      Conforme a <strong>Lei Geral de Proteção de Dados (LGPD – Lei nº 13.709/2018)</strong>,
+      você tem o direito de solicitar a exclusão de todos os seus dados pessoais do SintonIA.
+      Os seguintes dados serão apagados permanentemente:
+    </p>
+
+    <ul class="data-list">
+      <li><span class="dot"></span> Perfil e dados pessoais (nome, e-mail, bio)</li>
+      <li><span class="dot"></span> Perfil sensorial, valores e preferências</li>
+      <li><span class="dot"></span> Pets e fotos dos pets (Storage)</li>
+      <li><span class="dot"></span> Foto de perfil e arquivos enviados</li>
+      <li><span class="dot"></span> Mensagens e histórico de conversas</li>
+      <li><span class="dot"></span> Publicações, comentários e interações</li>
+      <li><span class="dot"></span> Conta de autenticação</li>
+    </ul>
+
+    <form id="deleteForm" novalidate>
+      <label for="email">E-mail da conta *</label>
+      <input
+        type="email"
+        id="email"
+        name="email"
+        placeholder="seu@email.com"
+        required
+        autocomplete="email"
+      />
+      <span class="error-msg" id="emailError">Por favor, informe um e-mail válido.</span>
+
+      <label for="reason">Motivo da solicitação (opcional)</label>
+      <textarea
+        id="reason"
+        name="reason"
+        placeholder="Descreva brevemente o motivo da exclusão..."
+      ></textarea>
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="confirmCheck" name="confirmCheck" required />
+        <label for="confirmCheck">
+          Confirmo que li e entendi que esta ação é <strong>irreversível</strong> e que todos
+          os meus dados serão permanentemente excluídos do SintonIA.
+        </label>
+      </div>
+
+      <button type="submit" class="btn-delete" id="submitBtn" disabled>
+        🗑️ Solicitar Exclusão Permanente
+      </button>
+    </form>
+
+    <div class="success-box" id="successBox">
+      <h3>✅ Solicitação recebida!</h3>
+      <p>
+        Sua solicitação de exclusão de dados foi registrada com sucesso.<br />
+        Você receberá uma confirmação no e-mail informado em até <strong>72 horas</strong>.<br /><br />
+        Caso tenha o aplicativo instalado, você também pode excluir sua conta diretamente
+        em <strong>Configurações → Privacidade e Conta → Excluir minha conta e dados</strong>.
+      </p>
+    </div>
+  </div>
+
+  <footer>
+    <p>
+      SintonIA – Rede Social para Pessoas Neurodivergentes<br />
+      <a href="https://sintonia9168.builtwithrocket.new">sintonia9168.builtwithrocket.new</a>
+      &nbsp;|&nbsp;
+      Dúvidas? Entre em contato: <a href="mailto:privacidade@sintonia.app">privacidade@sintonia.app</a>
+    </p>
+    <p style="margin-top:8px;">
+      Conforme LGPD (Lei nº 13.709/2018) e Política de Privacidade do Google Play
+    </p>
+  </footer>
+
+  <script>
+    const form = document.getElementById('deleteForm');
+    const emailInput = document.getElementById('email');
+    const emailError = document.getElementById('emailError');
+    const confirmCheck = document.getElementById('confirmCheck');
+    const submitBtn = document.getElementById('submitBtn');
+    const successBox = document.getElementById('successBox');
+
+    function validateEmail(email) {
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    }
+
+    function updateSubmitState() {
+      const emailOk = validateEmail(emailInput.value.trim());
+      const checked = confirmCheck.checked;
+      submitBtn.disabled = !(emailOk && checked);
+    }
+
+    emailInput.addEventListener('input', () => {
+      emailError.style.display = validateEmail(emailInput.value.trim()) ? 'none' : 'block';
+      updateSubmitState();
+    });
+
+    confirmCheck.addEventListener('change', updateSubmitState);
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      if (!validateEmail(emailInput.value.trim())) {
+        emailError.style.display = 'block';
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = '⏳ Enviando solicitação...';
+
+      // Simulate sending (replace with your actual backend endpoint if needed)
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
+      form.style.display = 'none';
+      successBox.style.display = 'block';
+    });
+  </script>
+
+</body>
+</html>

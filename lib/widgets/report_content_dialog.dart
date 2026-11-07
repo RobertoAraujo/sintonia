@@ -10,12 +10,14 @@ class ReportContentDialog extends StatefulWidget {
   final String contentType; // 'post', 'comment', 'message', 'profile'
   final String? contentId;
   final String? reportedUserId;
+  final String? postAuthorId; // author of the post being reported
 
   const ReportContentDialog({
     super.key,
     required this.contentType,
     this.contentId,
     this.reportedUserId,
+    this.postAuthorId,
   });
 
   @override
@@ -74,6 +76,7 @@ class _ReportContentDialogState extends State<ReportContentDialog> {
         contentId: widget.contentId,
         reason: _selectedReason!,
         details: _isOtherSelected ? _detailsCtrl.text.trim() : null,
+        postAuthorId: widget.postAuthorId,
       );
       if (mounted) {
         Navigator.pop(context);
@@ -161,7 +164,11 @@ class _ReportContentDialogState extends State<ReportContentDialog> {
   Future<void> _blockUser() async {
     if (widget.reportedUserId == null) return;
     try {
-      await SupabaseService.instance.blockUser(widget.reportedUserId!);
+      await SupabaseService.instance.submitReport(
+        reportedUserId: widget.reportedUserId,
+        contentType: 'profile',
+        reason: 'Outro',
+      );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -316,12 +323,14 @@ void showReportDialog(
   required String contentType,
   String? contentId,
   String? reportedUserId,
+  String? postAuthorId,
 }) {
   showDialog(
     context: context,
     builder: (_) => ReportContentDialog(
       contentType: contentType,
       contentId: contentId,
+      postAuthorId: postAuthorId,
       reportedUserId: reportedUserId,
     ),
   );

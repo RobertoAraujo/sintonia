@@ -1,6 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:sizer/sizer.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/app_export.dart';
 import '../../../services/supabase_service.dart';
@@ -19,6 +20,7 @@ class ProfileSettingsScreen extends StatefulWidget {
 class _ProfileSettingsScreenState extends State<ProfileSettingsScreen> {
   bool _isLoading = true;
   bool _isDeletingAccount = false;
+  bool _isExportingData = false;
 
   // Settings state
   bool _profilePublic = true;
@@ -61,6 +63,112 @@ class _ProfileSettingsScreenState extends State<ProfileSettingsScreen> {
   }
 
   // ── Account deletion ──────────────────────────────────────────────────────
+
+  // ── Data Export (LGPD Art. 18) ────────────────────────────────────────────
+
+  Future<void> _exportUserData() async {
+    setState(() => _isExportingData = true);
+    try {
+      final data = await SupabaseService.instance.exportUserData();
+      if (!mounted) return;
+      setState(() => _isExportingData = false);
+      if (data == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              'Não foi possível exportar os dados. Tente novamente.',
+            ),
+            backgroundColor: AppTheme.error,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        );
+        return;
+      }
+      // Show data summary dialog with copy option
+      final jsonStr = const JsonEncoder.withIndent('  ').convert(data);
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          title: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: AppTheme.primary.withAlpha(20),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(
+                  Icons.download_rounded,
+                  color: AppTheme.primary,
+                  size: 20,
+                ),
+              ),
+              SizedBox(width: 2.w),
+              const Expanded(child: Text('Seus Dados (LGPD)')),
+            ],
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Seus dados pessoais foram exportados conforme o Art. 18 da LGPD. '
+                  'Copie o conteúdo abaixo para salvar.',
+                  style: TextStyle(fontSize: 12.sp, height: 1.4),
+                ),
+                SizedBox(height: 1.5.h),
+                Container(
+                  height: 20.h,
+                  padding: EdgeInsets.all(2.w),
+                  decoration: BoxDecoration(
+                    color: Theme.of(ctx).colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: Theme.of(ctx).colorScheme.outlineVariant,
+                    ),
+                  ),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      jsonStr,
+                      style: TextStyle(fontSize: 9.sp, fontFamily: 'monospace'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Fechar'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isExportingData = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Erro ao exportar dados: $e'),
+          backgroundColor: AppTheme.error,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+      );
+    }
+  }
 
   Future<void> _showDeleteAccountDialog() async {
     final TextEditingController confirmController = TextEditingController();
@@ -319,19 +427,12 @@ class _ProfileSettingsScreenState extends State<ProfileSettingsScreen> {
             onPressed: () async {
               Navigator.of(dialogContext, rootNavigator: true).pop();
               try {
-                await Supabase.instance.client.auth.signOut();
-                if (context.mounted) {
-                  context.go('/login');
-                }
+                await SupabaseService.instance.signOut();
               } catch (e) {
                 debugPrint('Erro ao deslogar: $e');
+              } finally {
                 if (context.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('Erro ao sair da conta: $e'),
-                      backgroundColor: AppTheme.error,
-                    ),
-                  );
+                  context.go('/login');
                 }
               }
             },
@@ -573,8 +674,84 @@ class _ProfileSettingsScreenState extends State<ProfileSettingsScreen> {
 
                 // ── Privacidade e Conta (LGPD) ────────────────────────
                 SizedBox(height: 1.5.h),
-                _SectionHeader('Privacidade e Conta'),
+                _SectionHeader('Privacidade e Conta (LGPD)'),
                 SizedBox(height: 0.8.h),
+                // Export data button
+                Container(
+                  padding: EdgeInsets.all(3.w),
+                  decoration: BoxDecoration(
+                    color: AppTheme.primary.withAlpha(10),
+                    borderRadius: BorderRadius.circular(16.0),
+                    border: Border.all(
+                      color: AppTheme.primary.withAlpha(60),
+                      width: 1,
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.download_outlined,
+                            color: AppTheme.primary,
+                            size: 18,
+                          ),
+                          SizedBox(width: 2.w),
+                          Text(
+                            'Exportar Meus Dados (Art. 18 LGPD)',
+                            style: TextStyle(
+                              color: AppTheme.primary,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 12.sp,
+                            ),
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 1.h),
+                      Text(
+                        'Você tem o direito de receber uma cópia de todos os seus dados pessoais armazenados no SintonIA, conforme o Art. 18 da LGPD.',
+                        style: TextStyle(
+                          fontSize: 11.sp,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          height: 1.4,
+                        ),
+                      ),
+                      SizedBox(height: 1.5.h),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: _isExportingData ? null : _exportUserData,
+                          icon: _isExportingData
+                              ? SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: AppTheme.primary,
+                                  ),
+                                )
+                              : const Icon(Icons.download_rounded, size: 18),
+                          label: Text(
+                            _isExportingData
+                                ? 'Exportando...'
+                                : 'Exportar meus dados',
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: AppTheme.primary,
+                            side: BorderSide(color: AppTheme.primary),
+                            minimumSize: const Size(double.infinity, 48),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12.0),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                SizedBox(height: 1.5.h),
                 Container(
                   padding: EdgeInsets.all(3.w),
                   decoration: BoxDecoration(

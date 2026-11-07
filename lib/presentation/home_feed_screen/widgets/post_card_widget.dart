@@ -13,6 +13,7 @@ class PostCardWidget extends StatelessWidget {
   final VoidCallback onSave;
   final VoidCallback onAuthorTap;
   final VoidCallback? onDelete;
+  final VoidCallback? onEdit;
 
   const PostCardWidget({
     super.key,
@@ -23,6 +24,7 @@ class PostCardWidget extends StatelessWidget {
     required this.onSave,
     required this.onAuthorTap,
     this.onDelete,
+    this.onEdit,
   });
 
   Color _neurodivColor(String type) {
@@ -65,13 +67,10 @@ class PostCardWidget extends StatelessWidget {
               children: [
                 GestureDetector(
                   onTap: onAuthorTap,
-                  child: Hero(
-                    tag: 'avatar_${post['authorId']}',
-                    child: UserAvatar(
-                      avatarUrl: post['authorImage'] as String?,
-                      displayName: post['authorName'] as String? ?? 'U',
-                      radius: 20,
-                    ),
+                  child: UserAvatar(
+                    avatarUrl: post['authorImage'] as String?,
+                    displayName: post['authorName'] as String? ?? 'U',
+                    radius: 20,
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -200,6 +199,21 @@ class PostCardWidget extends StatelessWidget {
                               ],
                             ),
                           ),
+                        if (onEdit != null)
+                          PopupMenuItem(
+                            onTap: () {
+                              Future.delayed(Duration.zero, () {
+                                onEdit!();
+                              });
+                            },
+                            child: Row(
+                              children: const [
+                                Icon(Icons.edit_outlined),
+                                SizedBox(width: 12),
+                                Text('Editar publicação'),
+                              ],
+                            ),
+                          ),
                         PopupMenuItem(
                           onTap: () {
                             Future.delayed(Duration.zero, () {
@@ -208,6 +222,7 @@ class PostCardWidget extends StatelessWidget {
                                 contentType: 'post',
                                 contentId: post['id']?.toString(),
                                 reportedUserId: post['authorId']?.toString(),
+                                postAuthorId: post['authorId']?.toString(),
                               );
                             });
                           },

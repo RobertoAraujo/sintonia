@@ -6,6 +6,10 @@ import '../../models/profile_match_result.dart';
 import '../../models/user_profile.dart';
 import '../../repositories/supabase_recommendation_repository.dart';
 import '../../services/supabase_service.dart';
+import '../../theme/app_theme.dart';
+import '../../widgets/app_navigation.dart';
+import '../../widgets/app_scaffold.dart' show navBarVisibleNotifier;
+import '../user_profile_screen/user_profile_screen.dart';
 import './widgets/friend_list_item_widget.dart';
 import './widgets/friend_request_card_widget.dart';
 import './widgets/suggestion_card_widget.dart';
@@ -21,7 +25,16 @@ class _FriendsScreenState extends State<FriendsScreen>
     with SingleTickerProviderStateMixin {
   late TabController _tabController;
   final TextEditingController _searchController = TextEditingController();
+  final TextEditingController _suggestionsSearchController =
+      TextEditingController();
   String _searchQuery = '';
+  String _suggestionsSearchQuery = '';
+
+  // ── Scroll controllers for hide-on-scroll nav bar ─────────────────────────
+  final ScrollController _suggestionsScrollController = ScrollController();
+  final ScrollController _requestsScrollController = ScrollController();
+  final ScrollController _friendsScrollController = ScrollController();
+  double _lastScrollOffset = 0.0;
 
   // ── Real Supabase recommendation engine ──────────────────────────────────
   final SupabaseRecommendationRepository _repository =
@@ -43,6 +56,9 @@ class _FriendsScreenState extends State<FriendsScreen>
   // Tracks which suggestion ids have been connected
   final Set<String> _connectedIds = {};
 
+  // ── Hyperfocus filter ─────────────────────────────────────────────────────
+  String? _selectedHyperfocusFilter; // null = "Todos"
+
   // ── Realtime subscription ─────────────────────────────────────────────────
   RealtimeChannel? _friendshipsChannel;
 
@@ -50,18 +66,68 @@ class _FriendsScreenState extends State<FriendsScreen>
   void initState() {
     super.initState();
     _tabController = TabController(length: 3, vsync: this);
+    _tabController.addListener(_onTabChanged);
     _loadCurrentUserAndRecommendations();
     _loadFriendRequests();
     _loadFriends();
     _subscribeFriendships();
+    _suggestionsScrollController.addListener(_onScroll);
+    _requestsScrollController.addListener(_onScroll);
+    _friendsScrollController.addListener(_onScroll);
   }
 
   @override
   void dispose() {
     _friendshipsChannel?.unsubscribe();
+    _tabController.removeListener(_onTabChanged);
     _tabController.dispose();
     _searchController.dispose();
+    _suggestionsSearchController.dispose();
+    _suggestionsScrollController.removeListener(_onScroll);
+    _requestsScrollController.removeListener(_onScroll);
+    _friendsScrollController.removeListener(_onScroll);
+    _suggestionsScrollController.dispose();
+    _requestsScrollController.dispose();
+    _friendsScrollController.dispose();
+    // Restore nav bar when leaving this screen
+    navBarVisibleNotifier.value = true;
     super.dispose();
+  }
+
+  void _onScroll() {
+    // Use the active tab's controller offset
+    final ScrollController active;
+    switch (_tabController.index) {
+      case 0:
+        active = _suggestionsScrollController;
+        break;
+      case 1:
+        active = _requestsScrollController;
+        break;
+      default:
+        active = _friendsScrollController;
+    }
+    if (!active.hasClients) return;
+    final offset = active.offset;
+    final delta = offset - _lastScrollOffset;
+    _lastScrollOffset = offset;
+
+    if (offset <= 10) {
+      if (!navBarVisibleNotifier.value) navBarVisibleNotifier.value = true;
+      return;
+    }
+    if (delta > 8 && navBarVisibleNotifier.value) {
+      navBarVisibleNotifier.value = false;
+    } else if (delta < -8 && !navBarVisibleNotifier.value) {
+      navBarVisibleNotifier.value = true;
+    }
+  }
+
+  void _onTabChanged() {
+    // When user opens the Pedidos tab (index 1), clear the badge
+    if (_tabController.index == 1) {
+      pendingFriendRequestsNotifier.value = 0;
+    }
   }
 
   /// Subscribe to Realtime changes on friendships so new requests appear
@@ -71,7 +137,7 @@ class _FriendsScreenState extends State<FriendsScreen>
     if (uid == null) return;
 
     _friendshipsChannel = SupabaseService.instance.client
-        .channel('friendships_$uid')
+        .channel('friendships_screen_$uid')
         .onPostgresChanges(
           event: PostgresChangeEvent.insert,
           schema: 'public',
@@ -83,7 +149,13 @@ class _FriendsScreenState extends State<FriendsScreen>
           ),
           callback: (payload) {
             // A new friend request arrived — refresh the requests list
-            if (mounted) _loadFriendRequests();
+            if (mounted) {
+              _loadFriendRequests();
+              // Update global badge (only if not on Pedidos tab)
+              if (_tabController.index != 1) {
+                pendingFriendRequestsNotifier.value++;
+              }
+            }
           },
         )
         .onPostgresChanges(
@@ -113,6 +185,7 @@ class _FriendsScreenState extends State<FriendsScreen>
         final requester = r['requester'] as Map<String, dynamic>? ?? {};
         return {
           'id': r['id'] ?? '',
+          'requesterId': requester['id'] ?? r['requester_id'] ?? '',
           'name': requester['full_name'] ?? 'Usuário',
           'neurodivType': requester['neurodiv_type'] ?? '',
           'compatibilityPct': 0,
@@ -129,6 +202,10 @@ class _FriendsScreenState extends State<FriendsScreen>
           ..addAll(mapped);
         _loadingRequests = false;
       });
+      // Sync global badge with actual count (only if not viewing Pedidos tab)
+      if (_tabController.index != 1) {
+        pendingFriendRequestsNotifier.value = mapped.length;
+      }
     } catch (_) {
       if (mounted) setState(() => _loadingRequests = false);
     }
@@ -211,6 +288,45 @@ class _FriendsScreenState extends State<FriendsScreen>
     }
   }
 
+  /// Returns the list of unique hyperfocus tags from the current user's profile.
+  List<String> get _myHyperfocusTags {
+    final interests = _currentUserProfile?.hyperfocusInterests ?? [];
+    final seen = <String>{};
+    return interests
+        .where((t) => t.isNotEmpty && seen.add(t.toLowerCase()))
+        .toList();
+  }
+
+  /// Returns recommendations filtered by the selected hyperfocus tag AND search query.
+  List<ProfileMatchResult> get _filteredRecommendations {
+    var list = _recommendations;
+
+    // Filter by hyperfocus chip
+    if (_selectedHyperfocusFilter != null) {
+      final filter = _selectedHyperfocusFilter!.toLowerCase();
+      list = list.where((r) {
+        final interests = r.profile.hyperfocusInterests
+            .map((i) => i.toLowerCase())
+            .toList();
+        return interests.contains(filter);
+      }).toList();
+    }
+
+    // Filter by search query (name or hyperfocus tags)
+    if (_suggestionsSearchQuery.isNotEmpty) {
+      final q = _suggestionsSearchQuery.toLowerCase();
+      list = list.where((r) {
+        final nameMatch = r.profile.displayName.toLowerCase().contains(q);
+        final tagMatch = r.profile.hyperfocusInterests.any(
+          (tag) => tag.toLowerCase().contains(q),
+        );
+        return nameMatch || tagMatch;
+      }).toList();
+    }
+
+    return list;
+  }
+
   /// Converts a [ProfileMatchResult] to the Map shape expected by
   /// [SuggestionCardWidget], preserving the existing widget contract.
   Map<String, dynamic> _resultToMap(ProfileMatchResult result) {
@@ -231,6 +347,13 @@ class _FriendsScreenState extends State<FriendsScreen>
         ? shared
         : p.hyperfocusInterests.take(2).toList();
 
+    // Format distance label
+    String? distanceLabel;
+    if (result.distanceKm != null) {
+      final km = result.distanceKm!;
+      distanceLabel = km < 1.0 ? '< 1 km' : '${km.toStringAsFixed(1)} km';
+    }
+
     return {
       'id': p.id,
       'name': p.displayName,
@@ -249,7 +372,11 @@ class _FriendsScreenState extends State<FriendsScreen>
       'communicationScore': (result.communicationScore * 100).round(),
       // AI refinement data
       'aiInsight': result.aiInsight,
+      'shortInsight': result.shortInsight,
       'aiRefined': result.aiRefined,
+      'connectionPotential': result.connectionPotential,
+      // Distance from RPC
+      'distanceLabel': distanceLabel,
     };
   }
 
@@ -284,6 +411,21 @@ class _FriendsScreenState extends State<FriendsScreen>
   void _connectSuggestion(String id) {
     setState(() => _connectedIds.add(id));
     SupabaseService.instance.sendFriendRequest(id);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Row(
+          children: [
+            Icon(Icons.person_add_rounded, color: Colors.white, size: 18),
+            SizedBox(width: 8),
+            Text('Pedido de amizade enviado! 🎉'),
+          ],
+        ),
+        backgroundColor: AppTheme.primary,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   void _acceptRequest(String id) {
@@ -294,6 +436,10 @@ class _FriendsScreenState extends State<FriendsScreen>
     final friendshipId = req['friendshipId'] as String? ?? id;
     SupabaseService.instance.acceptFriendRequest(friendshipId);
     setState(() => _requestsMaps.removeWhere((r) => r['id'] == id));
+    // Update global badge count
+    if (pendingFriendRequestsNotifier.value > 0) {
+      pendingFriendRequestsNotifier.value--;
+    }
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         content: Text('Amizade aceita! 🎉'),
@@ -311,6 +457,10 @@ class _FriendsScreenState extends State<FriendsScreen>
     final friendshipId = req['friendshipId'] as String? ?? id;
     SupabaseService.instance.declineFriendRequest(friendshipId);
     setState(() => _requestsMaps.removeWhere((r) => r['id'] == id));
+    // Update global badge count
+    if (pendingFriendRequestsNotifier.value > 0) {
+      pendingFriendRequestsNotifier.value--;
+    }
   }
 
   // ── Build ─────────────────────────────────────────────────────────────────
@@ -335,11 +485,6 @@ class _FriendsScreenState extends State<FriendsScreen>
                 children: [
                   Expanded(
                     child: Text('Amigos', style: theme.textTheme.headlineSmall),
-                  ),
-                  CustomIconWidget(
-                    iconName: 'person_search_outlined',
-                    color: AppTheme.primary,
-                    size: 26,
                   ),
                 ],
               ),
@@ -431,6 +576,7 @@ class _FriendsScreenState extends State<FriendsScreen>
                           ),
                         )
                       : ListView.builder(
+                          controller: _requestsScrollController,
                           padding: EdgeInsets.fromLTRB(
                             16,
                             16,
@@ -441,6 +587,22 @@ class _FriendsScreenState extends State<FriendsScreen>
                           itemBuilder: (context, index) =>
                               FriendRequestCardWidget(
                                 request: _requestsMaps[index],
+                                onTap: () {
+                                  final req = _requestsMaps[index];
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => UserProfileScreen(
+                                        userData: {
+                                          'id': req['requesterId'],
+                                          'full_name': req['name'],
+                                          'avatar_url': req['imageUrl'],
+                                          'neurodiv_type': req['neurodivType'],
+                                        },
+                                      ),
+                                    ),
+                                  );
+                                },
                                 onAccept: () => _acceptRequest(
                                   _requestsMaps[index]['id'] as String,
                                 ),
@@ -496,6 +658,7 @@ class _FriendsScreenState extends State<FriendsScreen>
                       ),
                       Expanded(
                         child: ListView.builder(
+                          controller: _friendsScrollController,
                           padding: EdgeInsets.fromLTRB(
                             16,
                             4,
@@ -628,12 +791,132 @@ class _FriendsScreenState extends State<FriendsScreen>
 
     final aiRefinedCount = _recommendations.where((r) => r.aiRefined).length;
     final isAiRefined = aiRefinedCount > 0;
+    final myTags = _myHyperfocusTags;
+    final filtered = _filteredRecommendations;
 
     return Column(
       children: [
+        // ── Search bar for suggestions ─────────────────────────────────────
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: TextField(
+            controller: _suggestionsSearchController,
+            onChanged: (v) =>
+                setState(() => _suggestionsSearchQuery = v.toLowerCase()),
+            decoration: InputDecoration(
+              hintText: 'Buscar por nome ou hiperfoco...',
+              prefixIcon: Icon(
+                Icons.search_rounded,
+                color: theme.colorScheme.onSurfaceVariant,
+                size: 20,
+              ),
+              suffixIcon: _suggestionsSearchQuery.isNotEmpty
+                  ? IconButton(
+                      icon: Icon(
+                        Icons.close_rounded,
+                        size: 18,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      onPressed: () {
+                        _suggestionsSearchController.clear();
+                        setState(() => _suggestionsSearchQuery = '');
+                      },
+                    )
+                  : null,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 10,
+              ),
+              filled: true,
+              fillColor: theme.colorScheme.surface,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(100),
+                borderSide: BorderSide(color: theme.colorScheme.outlineVariant),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(100),
+                borderSide: BorderSide(color: theme.colorScheme.outlineVariant),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(100),
+                borderSide: const BorderSide(color: AppTheme.primary, width: 2),
+              ),
+            ),
+          ),
+        ),
+
+        // ── Hyperfocus filter chip bar ─────────────────────────────────────
+        if (myTags.isNotEmpty)
+          SizedBox(
+            height: 44,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
+              children: [
+                // "Todos" chip
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: FilterChip(
+                    label: const Text('Todos'),
+                    selected: _selectedHyperfocusFilter == null,
+                    onSelected: (_) =>
+                        setState(() => _selectedHyperfocusFilter = null),
+                    selectedColor: AppTheme.primary.withAlpha(30),
+                    checkmarkColor: AppTheme.primary,
+                    labelStyle: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: _selectedHyperfocusFilter == null
+                          ? AppTheme.primary
+                          : theme.colorScheme.onSurfaceVariant,
+                    ),
+                    side: BorderSide(
+                      color: _selectedHyperfocusFilter == null
+                          ? AppTheme.primary
+                          : theme.colorScheme.outlineVariant,
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                ),
+                // One chip per hyperfocus tag
+                ...myTags.map((tag) {
+                  final isSelected = _selectedHyperfocusFilter == tag;
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: FilterChip(
+                      label: Text(tag),
+                      selected: isSelected,
+                      onSelected: (_) => setState(
+                        () =>
+                            _selectedHyperfocusFilter = isSelected ? null : tag,
+                      ),
+                      selectedColor: AppTheme.primary.withAlpha(30),
+                      checkmarkColor: AppTheme.primary,
+                      labelStyle: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: isSelected
+                            ? AppTheme.primary
+                            : theme.colorScheme.onSurfaceVariant,
+                      ),
+                      side: BorderSide(
+                        color: isSelected
+                            ? AppTheme.primary
+                            : theme.colorScheme.outlineVariant,
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                  );
+                }),
+              ],
+            ),
+          ),
+
         // Engine info banner
         Container(
-          margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+          margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
             gradient: LinearGradient(
@@ -702,7 +985,11 @@ class _FriendsScreenState extends State<FriendsScreen>
                       ],
                     ),
                     Text(
-                      isAiRefined
+                      _suggestionsSearchQuery.isNotEmpty
+                          ? '${filtered.length} resultado${filtered.length != 1 ? 's' : ''} para "$_suggestionsSearchQuery"'
+                          : _selectedHyperfocusFilter != null
+                          ? '${filtered.length} perfis com hiperfoco em "$_selectedHyperfocusFilter"'
+                          : isAiRefined
                           ? '${_recommendations.length} perfis analisados por hiperfocuses, comunicação e neurotipo'
                           : '${_recommendations.length} perfis ranqueados por hiperfocuses, valores, neurotipo e comunicação',
                       style: theme.textTheme.labelSmall?.copyWith(
@@ -724,18 +1011,71 @@ class _FriendsScreenState extends State<FriendsScreen>
           ),
         ),
         Expanded(
-          child: ListView.builder(
-            padding: EdgeInsets.fromLTRB(16, 8, 16, bottomPadding),
-            itemCount: _recommendations.length,
-            itemBuilder: (context, index) {
-              final result = _recommendations[index];
-              final suggestionMap = _resultToMap(result);
-              return SuggestionCardWidget(
-                suggestion: suggestionMap,
-                onConnect: () => _connectSuggestion(result.profile.id),
-              );
-            },
-          ),
+          child: filtered.isEmpty
+              ? Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.search_off_rounded,
+                        size: 48,
+                        color: theme.colorScheme.outlineVariant,
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        _suggestionsSearchQuery.isNotEmpty
+                            ? 'Nenhum resultado para "$_suggestionsSearchQuery"'
+                            : 'Nenhum perfil com esse hiperfoco',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextButton(
+                        onPressed: () {
+                          _suggestionsSearchController.clear();
+                          setState(() {
+                            _suggestionsSearchQuery = '';
+                            _selectedHyperfocusFilter = null;
+                          });
+                        },
+                        child: const Text('Limpar filtros'),
+                      ),
+                    ],
+                  ),
+                )
+              : ListView.builder(
+                  controller: _suggestionsScrollController,
+                  padding: EdgeInsets.fromLTRB(16, 8, 16, bottomPadding),
+                  itemCount: filtered.length,
+                  itemBuilder: (context, index) {
+                    final result = filtered[index];
+                    final suggestionMap = _resultToMap(result);
+                    final isFriend = _friendsMaps.any(
+                      (f) => f['id'] == result.profile.id,
+                    );
+                    return SuggestionCardWidget(
+                      suggestion: suggestionMap,
+                      onConnect: () => _connectSuggestion(result.profile.id),
+                      isFriend: isFriend,
+                      onViewProfile: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => UserProfileScreen(
+                              userData: {
+                                'id': result.profile.id,
+                                'full_name': result.profile.displayName,
+                                'avatar_url': result.profile.avatarUrl ?? '',
+                                'neurodiv_type': suggestionMap['neurodivType'],
+                              },
+                            ),
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
         ),
       ],
     );

@@ -1,12 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../routes/app_routes.dart';
-import '../../services/media_permission_service.dart';
 import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/medical_disclaimer_banner_widget.dart';
+
+// ── Auth-only neon palette (Onboarding) ────────────────────────────────────
+const _kAuthBg = Color(0xFF0A0A0E);
+const _kAuthPurple = Color(0xFFC026D3);
+const _kAuthViolet = Color(0xFF7C3AED);
+const _kAuthCyan = Color(0xFF00D2FF);
+const _kAuthFieldBg = Color(0xFF18181B);
+const _kAuthHint = Color(0xFFA1A1AA);
+// ───────────────────────────────────────────────────────────────────────────
 
 class OnboardingScreen extends StatefulWidget {
   const OnboardingScreen({super.key});
@@ -351,24 +360,6 @@ class _OnboardingScreenState extends State<OnboardingScreen>
     });
   }
 
-  Future<void> _toggleCameraGalleryPermission(bool enabled) async {
-    if (!enabled) {
-      if (mounted) setState(() => _cameraGalleryEnabled = false);
-      return;
-    }
-
-    final cameraAllowed = await MediaPermissionService.request(camera: true);
-    final galleryAllowed = await MediaPermissionService.request(camera: false);
-    if (!mounted) return;
-
-    setState(() => _cameraGalleryEnabled = cameraAllowed && galleryAllowed);
-    if (!cameraAllowed || !galleryAllowed) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Permissão de câmera ou galeria negada.')),
-      );
-    }
-  }
-
   Future<void> _finishOnboarding() async {
     setState(() {
       _isLoading = true;
@@ -378,7 +369,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
     try {
       // 1. Create auth account
       final signUpResponse = await SupabaseService.instance.signUp(
-        email: _emailCtrl.text.trim(),
+        email: _emailCtrl.text.trim().toLowerCase(),
         password: _passwordCtrl.text,
         fullName: _nameCtrl.text.trim(),
         username: _nameCtrl.text.trim().toLowerCase().replaceAll(' ', '_'),
@@ -394,24 +385,75 @@ class _OnboardingScreenState extends State<OnboardingScreen>
         return;
       }
 
-      // 2. Sign in immediately to establish a valid session (required for RLS)
-      final signInResponse = await SupabaseService.instance.signIn(
-        email: _emailCtrl.text.trim(),
-        password: _passwordCtrl.text,
-      );
+      // 2. Get a valid session — either from signUp or by signing in immediately
+      String? uid = signUpResponse.user!.id;
 
-      if (!mounted) return;
-
-      if (signInResponse.user == null || signInResponse.session == null) {
-        setState(() {
-          _isLoading = false;
-          _authError =
-              'Conta criada, mas não foi possível fazer login. Tente entrar manualmente.';
-        });
-        return;
+      if (signUpResponse.session == null) {
+        // Email confirmation may be required — try signing in immediately
+        // (works when auto-confirm is enabled on the server)
+        try {
+          final signInResponse = await SupabaseService.instance.signIn(
+            email: _emailCtrl.text.trim().toLowerCase(),
+            password: _passwordCtrl.text,
+          );
+          if (!mounted) return;
+          if (signInResponse.session == null) {
+            // Email confirmation truly required
+            setState(() {
+              _isLoading = false;
+              _authError =
+                  'Conta criada! Verifique seu e-mail para confirmar o cadastro antes de entrar.';
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: const Text(
+                  'Conta criada! Confirme seu e-mail para continuar.',
+                ),
+                backgroundColor: const Color(0xFF7C3AED),
+                behavior: SnackBarBehavior.floating,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                duration: const Duration(seconds: 6),
+                margin: const EdgeInsets.all(16),
+              ),
+            );
+            return;
+          }
+          uid = signInResponse.user!.id;
+        } catch (signInErr) {
+          // If sign-in also fails, inform user to confirm email
+          if (!mounted) return;
+          setState(() {
+            _isLoading = false;
+            _authError =
+                'Conta criada! Verifique seu e-mail para confirmar o cadastro antes de entrar.';
+          });
+          return;
+        }
       }
 
-      // 3. Map selected neurotype to valid enum value
+      // 3. Ensure we have a valid session
+      if (SupabaseService.instance.currentUserId == null) {
+        final signInResponse = await SupabaseService.instance.signIn(
+          email: _emailCtrl.text.trim().toLowerCase(),
+          password: _passwordCtrl.text,
+        );
+
+        if (!mounted) return;
+
+        if (signInResponse.user == null || signInResponse.session == null) {
+          setState(() {
+            _isLoading = false;
+            _authError = 'Conta criada! Faça login para continuar.';
+          });
+          context.go(AppRoutes.loginScreen);
+          return;
+        }
+        uid = signInResponse.user!.id;
+      }
+
+      // 4. Map selected neurotype to valid enum value
       String? neurodivTypeValue;
       if (_selectedNeurotypes.isNotEmpty) {
         const enumMap = {
@@ -428,12 +470,11 @@ class _OnboardingScreenState extends State<OnboardingScreen>
         neurodivTypeValue = enumMap[first] ?? 'Outro';
       }
 
-      // 4. Save full profile data — now we have a valid session so RLS allows it
-      final uid = signInResponse.user!.id;
+      // 5. Save full profile data — now we have a valid session so RLS allows it
       final now = DateTime.now().toIso8601String();
       await SupabaseService.instance.client.from('user_profiles').upsert({
         'id': uid,
-        'email': _emailCtrl.text.trim(),
+        'email': _emailCtrl.text.trim().toLowerCase(),
         'full_name': _nameCtrl.text.trim(),
         'username': _nameCtrl.text.trim().toLowerCase().replaceAll(' ', '_'),
         'bio': _bioCtrl.text.trim(),
@@ -450,6 +491,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
         if (_birthDate != null)
           'birth_date': _birthDate!.toIso8601String().split('T').first,
         'is_adult': _isAgeValid,
+        'age_verified': _isAgeValid,
         'push_notifications_enabled': _pushNotificationsEnabled,
         'location_permissions_enabled': _locationEnabled,
         'camera_gallery_enabled': _cameraGalleryEnabled,
@@ -470,9 +512,23 @@ class _OnboardingScreenState extends State<OnboardingScreen>
           'comm_styles': _selectedCommStyles.toList(),
           'all_neurotypes': _selectedNeurotypes.toList(),
         },
-      });
+      }, onConflict: 'id');
 
       if (!mounted) return;
+
+      // ── Log LGPD consents (Art. 7 & 8) ─────────────────────────────────
+      if (_termsAccepted) {
+        await SupabaseService.instance.logConsent(consentType: 'terms');
+        await SupabaseService.instance.logConsent(
+          consentType: 'privacy_policy',
+        );
+      }
+      if (_sensitiveDataConsent) {
+        await SupabaseService.instance.logConsent(
+          consentType: 'sensitive_data',
+        );
+      }
+
       setState(() => _isLoading = false);
       context.go(AppRoutes.homeFeedScreen);
     } catch (e) {
@@ -509,14 +565,18 @@ class _OnboardingScreenState extends State<OnboardingScreen>
     if (error.contains('invalid_email') || error.contains('Invalid email')) {
       return 'E-mail inválido.';
     }
-    if (error.contains('network') || error.contains('SocketException')) {
-      return 'Sem conexão. Verifique sua internet.';
+    if (error.contains('Failed to fetch') ||
+        error.contains('AuthRetryableFetchException') ||
+        error.contains('XMLHttpRequest') ||
+        error.contains('network') ||
+        error.contains('SocketException')) {
+      return 'Sem conexão com o servidor. Verifique sua internet e tente novamente.';
     }
     if (error.contains('email not confirmed') ||
         error.contains('Email not confirmed')) {
       return 'Confirme seu e-mail antes de continuar.';
     }
-    return 'Erro ao criar conta: ${error.length > 120 ? error.substring(0, 120) : error}';
+    return 'Erro ao criar conta. Tente novamente.';
   }
 
   bool _canProceed() {
@@ -547,7 +607,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      backgroundColor: AppTheme.backgroundLight,
+      backgroundColor: _kAuthBg,
       body: SafeArea(
         child: Column(
           children: [
@@ -619,20 +679,14 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                   width: 40,
                   height: 40,
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color: _kAuthFieldBg,
                     shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withAlpha(25),
-                        blurRadius: 8,
-                        offset: const Offset(0, 2),
-                      ),
-                    ],
+                    border: Border.all(color: _kAuthViolet.withAlpha(102)),
                   ),
                   child: const Icon(
                     Icons.arrow_back_ios_new_rounded,
                     size: 16,
-                    color: Colors.black87,
+                    color: Colors.white,
                   ),
                 ),
               ),
@@ -643,15 +697,16 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                   vertical: 6,
                 ),
                 decoration: BoxDecoration(
-                  color: AppTheme.primaryContainer,
+                  color: _kAuthViolet.withAlpha(51),
                   borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: _kAuthViolet.withAlpha(128)),
                 ),
                 child: Text(
                   '${_currentStep + 1} / $_totalSteps',
                   style: GoogleFonts.nunitoSans(
                     fontSize: 12,
                     fontWeight: FontWeight.w700,
-                    color: AppTheme.onPrimaryContainer,
+                    color: _kAuthCyan,
                   ),
                 ),
               ),
@@ -665,10 +720,8 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                 borderRadius: BorderRadius.circular(4),
                 child: LinearProgressIndicator(
                   value: (_currentStep + 1) / _totalSteps,
-                  backgroundColor: theme.colorScheme.outlineVariant,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                    AppTheme.primary,
-                  ),
+                  backgroundColor: Colors.white.withAlpha(26),
+                  valueColor: const AlwaysStoppedAnimation<Color>(_kAuthViolet),
                   minHeight: 6,
                 ),
               );
@@ -680,15 +733,13 @@ class _OnboardingScreenState extends State<OnboardingScreen>
             style: GoogleFonts.nunitoSans(
               fontSize: 22,
               fontWeight: FontWeight.w800,
-              color: theme.colorScheme.onSurface,
+              color: Colors.white,
             ),
           ),
           const SizedBox(height: 4),
           Text(
             stepSubtitles[_currentStep],
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
+            style: GoogleFonts.nunitoSans(fontSize: 14, color: _kAuthHint),
           ),
           const SizedBox(height: 16),
         ],
@@ -702,10 +753,8 @@ class _OnboardingScreenState extends State<OnboardingScreen>
     return Container(
       padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
       decoration: BoxDecoration(
-        color: AppTheme.backgroundLight,
-        border: Border(
-          top: BorderSide(color: theme.colorScheme.outlineVariant),
-        ),
+        color: _kAuthBg,
+        border: Border(top: BorderSide(color: Colors.white.withAlpha(20))),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -718,20 +767,20 @@ class _OnboardingScreenState extends State<OnboardingScreen>
               decoration: BoxDecoration(
                 gradient: LinearGradient(
                   colors: canProceed
-                      ? [AppTheme.primary, AppTheme.primaryLight]
+                      ? [_kAuthPurple, _kAuthViolet, _kAuthCyan]
                       : [
-                          theme.colorScheme.outlineVariant,
-                          theme.colorScheme.outlineVariant,
+                          Colors.white.withAlpha(26),
+                          Colors.white.withAlpha(26),
                         ],
                   begin: Alignment.centerLeft,
                   end: Alignment.centerRight,
                 ),
-                borderRadius: BorderRadius.circular(16),
+                borderRadius: BorderRadius.circular(30),
                 boxShadow: canProceed
                     ? [
                         BoxShadow(
-                          color: AppTheme.primary.withAlpha(70),
-                          blurRadius: 14,
+                          color: _kAuthPurple.withAlpha(115),
+                          blurRadius: 18,
                           offset: const Offset(0, 5),
                         ),
                       ]
@@ -741,7 +790,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                 color: Colors.transparent,
                 child: InkWell(
                   onTap: canProceed && !_isLoading ? _nextStep : null,
-                  borderRadius: BorderRadius.circular(16),
+                  borderRadius: BorderRadius.circular(30),
                   child: Center(
                     child: _isLoading
                         ? const SizedBox(
@@ -758,9 +807,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                               Text(
                                 isLast ? 'Concluir Cadastro 🎉' : 'Continuar',
                                 style: GoogleFonts.nunitoSans(
-                                  color: canProceed
-                                      ? Colors.white
-                                      : theme.colorScheme.onSurfaceVariant,
+                                  color: canProceed ? Colors.white : _kAuthHint,
                                   fontSize: 15,
                                   fontWeight: FontWeight.w700,
                                 ),
@@ -770,9 +817,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                                 Icon(
                                   Icons.arrow_forward_rounded,
                                   size: 18,
-                                  color: canProceed
-                                      ? Colors.white
-                                      : theme.colorScheme.onSurfaceVariant,
+                                  color: canProceed ? Colors.white : _kAuthHint,
                                 ),
                               ],
                             ],
@@ -797,52 +842,57 @@ class _OnboardingScreenState extends State<OnboardingScreen>
           Center(
             child: Column(
               children: [
-                Image.asset(
-                  'assets/images/image-1789169868770.png',
-                  width: 100,
-                  height: 100,
-                  fit: BoxFit.contain,
-                  semanticLabel: 'SintonIA logotipo',
-                ),
-                const SizedBox(height: 8),
                 Stack(
+                  alignment: Alignment.center,
                   children: [
                     Container(
-                      width: 90,
-                      height: 90,
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(
-                          colors: [AppTheme.primary, AppTheme.secondary],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
+                      width: 130,
+                      height: 130,
+                      decoration: const BoxDecoration(
                         shape: BoxShape.circle,
-                      ),
-                      child: const Icon(
-                        Icons.person_rounded,
-                        color: Colors.white,
-                        size: 44,
+                        gradient: RadialGradient(
+                          colors: [
+                            Color(0x55C026D3),
+                            Color(0x337C3AED),
+                            Colors.transparent,
+                          ],
+                        ),
                       ),
                     ),
-                    Positioned(
-                      bottom: 0,
-                      right: 0,
-                      child: Container(
-                        width: 28,
-                        height: 28,
-                        decoration: BoxDecoration(
-                          color: AppTheme.secondary,
-                          shape: BoxShape.circle,
-                          border: Border.all(color: Colors.white, width: 2),
-                        ),
-                        child: const Icon(
-                          Icons.camera_alt_rounded,
-                          color: Colors.white,
-                          size: 14,
-                        ),
-                      ),
+                    Image.asset(
+                      'assets/images/logo-sem-fundo.png',
+                      width: 140,
+                      height: 102,
+                      fit: BoxFit.contain,
+                      semanticLabel:
+                          'SintonIA logo com balões de conversa em gradiente roxo e azul neon',
                     ),
                   ],
+                ),
+                const SizedBox(height: 12),
+                ShaderMask(
+                  shaderCallback: (bounds) => const LinearGradient(
+                    colors: [_kAuthPurple, _kAuthViolet, _kAuthCyan],
+                    begin: Alignment.centerLeft,
+                    end: Alignment.centerRight,
+                  ).createShader(bounds),
+                  child: Text(
+                    'SintonIA',
+                    style: GoogleFonts.nunitoSans(
+                      fontSize: 24,
+                      fontWeight: FontWeight.w800,
+                      color: Colors.white,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Crie sua conta',
+                  style: GoogleFonts.nunitoSans(
+                    fontSize: 13,
+                    color: _kAuthHint,
+                  ),
                 ),
               ],
             ),
@@ -1617,7 +1667,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
         _birthDate = picked;
         _birthDateText =
             '${picked.day.toString().padLeft(2, '0')}/${picked.month.toString().padLeft(2, '0')}/${picked.year}';
-        _isAgeValid = age >= 18;
+        _isAgeValid = age >= 13;
       });
     }
   }
@@ -1713,7 +1763,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'Você precisa ter pelo menos 18 anos para se cadastrar.',
+                      'Você precisa ter pelo menos 13 anos para se cadastrar.',
                       style: GoogleFonts.nunitoSans(
                         fontSize: 12,
                         color: AppTheme.error,
@@ -1791,7 +1841,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
             tag: 'Ao usar',
             tagColor: Colors.orange,
             value: _cameraGalleryEnabled,
-            onChanged: _toggleCameraGalleryPermission,
+            onChanged: (v) => setState(() => _cameraGalleryEnabled = v),
           ),
           const SizedBox(height: 10),
           _buildConsentTile(
@@ -2028,8 +2078,16 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                       const TextSpan(text: 'Li e aceito os '),
                       WidgetSpan(
                         child: GestureDetector(
-                          onTap: () {
-                            // TODO: open Terms of Use URL
+                          onTap: () async {
+                            final uri = Uri.parse(
+                              'https://sintonia9168.builtwithrocket.new/terms',
+                            );
+                            if (await canLaunchUrl(uri)) {
+                              await launchUrl(
+                                uri,
+                                mode: LaunchMode.externalApplication,
+                              );
+                            }
                           },
                           child: Text(
                             'Termos de Uso',
@@ -2045,8 +2103,16 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                       const TextSpan(text: ' e a '),
                       WidgetSpan(
                         child: GestureDetector(
-                          onTap: () {
-                            // TODO: open Privacy Policy URL
+                          onTap: () async {
+                            final uri = Uri.parse(
+                              'https://sintonia9168.builtwithrocket.new/privacy',
+                            );
+                            if (await canLaunchUrl(uri)) {
+                              await launchUrl(
+                                uri,
+                                mode: LaunchMode.externalApplication,
+                              );
+                            }
                           },
                           child: Text(
                             'Política de Privacidade',
@@ -2090,24 +2156,26 @@ class _OnboardingScreenState extends State<OnboardingScreen>
       maxLines: maxLines,
       keyboardType: keyboardType,
       onChanged: onChanged,
-      style: theme.textTheme.bodyMedium,
+      style: GoogleFonts.nunitoSans(color: Colors.white, fontSize: 15),
       decoration: InputDecoration(
         labelText: label,
+        labelStyle: GoogleFonts.nunitoSans(color: _kAuthHint, fontSize: 14),
         hintText: hint,
-        prefixIcon: Icon(icon, size: 20),
+        hintStyle: GoogleFonts.nunitoSans(color: _kAuthHint.withAlpha(153)),
+        prefixIcon: Icon(icon, size: 20, color: _kAuthHint),
         filled: true,
-        fillColor: theme.colorScheme.surface,
+        fillColor: _kAuthFieldBg,
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
-          borderSide: BorderSide(color: theme.colorScheme.outlineVariant),
+          borderSide: BorderSide(color: _kAuthViolet.withAlpha(77)),
         ),
         enabledBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
-          borderSide: BorderSide(color: theme.colorScheme.outlineVariant),
+          borderSide: BorderSide(color: _kAuthViolet.withAlpha(77)),
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
-          borderSide: const BorderSide(color: AppTheme.primary, width: 2),
+          borderSide: const BorderSide(color: _kAuthCyan, width: 1.5),
         ),
       ),
     );

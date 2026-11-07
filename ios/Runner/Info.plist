@@ -30,6 +30,8 @@
 	<string>Precisamos de acesso à câmera para que você possa tirar fotos e gravar vídeos para suas publicações.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Precisamos de acesso ao microfone para gravar vídeos com áudio.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Precisamos da sua localização para encontrar hospitais e serviços de emergência próximos a você.</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>

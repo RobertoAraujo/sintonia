@@ -31,6 +31,20 @@ class _SecuritySettingsScreenState extends State<SecuritySettingsScreen> {
   bool _isTerminatingSessions = false;
 
   @override
+  void initState() {
+    super.initState();
+    _loadTwoFASetting();
+  }
+
+  void _loadTwoFASetting() {
+    final user = SupabaseService.instance.currentUser;
+    if (user != null) {
+      final enabled = user.userMetadata?['two_fa_enabled'] == true;
+      setState(() => _twoFAEnabled = enabled);
+    }
+  }
+
+  @override
   void dispose() {
     _currentPasswordCtrl.dispose();
     _newPasswordCtrl.dispose();
@@ -98,26 +112,34 @@ class _SecuritySettingsScreenState extends State<SecuritySettingsScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF18181B),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20.0),
+          borderRadius: BorderRadius.circular(16.0),
         ),
-        title: const Text('Encerrar outras sessões?'),
+        title: const Text(
+          'Encerrar outras sessões?',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
         content: const Text(
           'Todos os outros dispositivos serão desconectados. Você permanecerá conectado neste dispositivo.',
+          style: TextStyle(color: Color(0xFFA1A1AA)),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancelar'),
+            child: const Text(
+              'Cancelar',
+              style: TextStyle(color: Color(0xFF00D2FF)),
+            ),
           ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: FilledButton.styleFrom(
-              backgroundColor: AppTheme.error,
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFB91C1C),
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12.0),
+                borderRadius: BorderRadius.circular(20),
               ),
             ),
+            onPressed: () => Navigator.pop(context, true),
             child: const Text(
               'Encerrar',
               style: TextStyle(color: Colors.white),
@@ -135,7 +157,7 @@ class _SecuritySettingsScreenState extends State<SecuritySettingsScreen> {
       await SupabaseService.instance.client.auth.signOut(
         scope: SignOutScope.others,
       );
-      _showSnack('Outras sessões encerradas com sucesso.');
+      _showSnack('Outras sessões encerradas com sucesso!');
     } catch (e) {
       _showSnack('Erro ao encerrar sessões: ${e.toString()}', isError: true);
     } finally {

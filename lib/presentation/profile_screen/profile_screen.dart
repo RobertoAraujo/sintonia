@@ -9,10 +9,13 @@ import '../../services/media_processing_service.dart';
 import '../../services/notification_service.dart';
 import '../../services/pet_avatar_notifier.dart';
 import '../../services/supabase_service.dart';
+import '../../services/user_settings_service.dart';
+import '../../widgets/app_scaffold.dart' show navBarVisibleNotifier;
 import '../media_upload/media_upload_modal.dart';
 import '../user_profile_screen/widgets/friends_list_page.dart';
 import './subpages/edit_profile_and_feed_screen.dart';
 import './subpages/followers_screen.dart';
+import './subpages/health_emergency_screen.dart';
 import './subpages/profile_diary_screen.dart';
 import './subpages/profile_settings_screen.dart';
 import './widgets/hyperfocus_section_widget.dart';
@@ -30,6 +33,15 @@ class _ProfileScreenState extends State<ProfileScreen>
     with SingleTickerProviderStateMixin {
   late TabController _tabController;
   bool _isLoadingProfile = true;
+
+  // Scroll controller for hide-on-scroll nav bar behaviour
+  final ScrollController _nestedScrollController = ScrollController();
+  double _lastScrollOffset = 0.0;
+
+  // Own privacy settings
+  bool _showHyperfocuses = true;
+  bool _showInterests = true;
+  bool _showPets = true;
 
   Map<String, dynamic> _profileData = {
     'name': '',
@@ -50,6 +62,7 @@ class _ProfileScreenState extends State<ProfileScreen>
 
   final List<Map<String, dynamic>> _postsMaps = [];
   final List<Map<String, dynamic>> _savedPostsMaps = [];
+  final List<Map<String, dynamic>> _diaryEntries = [];
   List<Map<String, dynamic>> _pendingRequests = [];
   bool _isLoadingRequests = false;
   RealtimeChannel? _friendshipChannel;
@@ -57,14 +70,46 @@ class _ProfileScreenState extends State<ProfileScreen>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
     AvatarNotifier.instance.addListener(_onAvatarChanged);
     PetAvatarNotifier.instance.addListener(_onPetAvatarChanged);
     _loadProfileData();
     _loadUserPosts();
     _loadSavedPosts();
+    _loadDiaryEntries();
     _loadPendingRequests();
+    _loadFriendsCount();
+    _loadCompatScore();
     _subscribeFriendshipRealtime();
+    _nestedScrollController.addListener(_onScroll);
+    _loadOwnSettings();
+  }
+
+  Future<void> _loadOwnSettings() async {
+    final settings = await UserSettingsService.instance.fetchSettings();
+    if (!mounted) return;
+    setState(() {
+      _showHyperfocuses = settings['show_hyperfocus'] ?? true;
+      _showInterests = settings['show_interests'] ?? true;
+      _showPets = settings['show_pets'] ?? true;
+    });
+  }
+
+  void _onScroll() {
+    if (!_nestedScrollController.hasClients) return;
+    final offset = _nestedScrollController.offset;
+    final delta = offset - _lastScrollOffset;
+    _lastScrollOffset = offset;
+
+    if (offset <= 10) {
+      if (!navBarVisibleNotifier.value) navBarVisibleNotifier.value = true;
+      return;
+    }
+    if (delta > 8 && navBarVisibleNotifier.value) {
+      navBarVisibleNotifier.value = false;
+    } else if (delta < -8 && !navBarVisibleNotifier.value) {
+      navBarVisibleNotifier.value = true;
+    }
   }
 
   void _onAvatarChanged() {
@@ -104,6 +149,44 @@ class _ProfileScreenState extends State<ProfileScreen>
     } catch (_) {
       if (mounted) setState(() => _isLoadingRequests = false);
     }
+  }
+
+  Future<void> _loadFriendsCount() async {
+    final uid = SupabaseService.instance.currentUserId;
+    if (uid == null) return;
+    try {
+      final rows = await SupabaseService.instance.client
+          .from('friendships')
+          .select('id')
+          .or('requester_id.eq.$uid,addressee_id.eq.$uid')
+          .eq('status', 'accepted');
+      if (!mounted) return;
+      setState(() {
+        _profileData = {..._profileData, 'friendsCount': (rows as List).length};
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _loadCompatScore() async {
+    final uid = SupabaseService.instance.currentUserId;
+    if (uid == null) return;
+    try {
+      final rows = await SupabaseService.instance.client
+          .from('user_matches')
+          .select('compatibility_score')
+          .or('user_id_1.eq.$uid,user_id_2.eq.$uid');
+      final list = rows as List;
+      if (list.isEmpty) return;
+      final avg =
+          list
+              .map((r) => (r['compatibility_score'] as num?)?.toDouble() ?? 0.0)
+              .reduce((a, b) => a + b) /
+          list.length;
+      if (!mounted) return;
+      setState(() {
+        _profileData = {..._profileData, 'compatScore': avg.round()};
+      });
+    } catch (_) {}
   }
 
   void _subscribeFriendshipRealtime() {
@@ -214,6 +297,56 @@ class _ProfileScreenState extends State<ProfileScreen>
           ..addAll(saved);
       });
     } catch (_) {}
+  }
+
+  Future<void> _loadDiaryEntries() async {
+    try {
+      final rows = await SupabaseService.instance.fetchDiaryEntries();
+      if (!mounted) return;
+      setState(() {
+        _diaryEntries
+          ..clear()
+          ..addAll(
+            rows.map((r) {
+              final createdAt = r['created_at'] != null
+                  ? DateTime.tryParse(r['created_at'].toString())?.toLocal()
+                  : null;
+              final tags = (r['tags'] as List?)?.cast<String>() ?? [];
+              return {
+                'id': r['id'] ?? '',
+                'date': createdAt != null
+                    ? _formatDiaryDate(createdAt)
+                    : 'Hoje',
+                'mood': (r['mood'] as String?)?.isNotEmpty == true
+                    ? r['mood']
+                    : '🌟',
+                'title': r['title'] ?? '',
+                'content': r['content'] ?? '',
+                'tags': tags,
+                'is_private': r['is_private'] ?? true,
+              };
+            }).toList(),
+          );
+      });
+    } catch (_) {}
+  }
+
+  String _formatDiaryDate(DateTime dt) {
+    const months = [
+      'Jan',
+      'Fev',
+      'Mar',
+      'Abr',
+      'Mai',
+      'Jun',
+      'Jul',
+      'Ago',
+      'Set',
+      'Out',
+      'Nov',
+      'Dez',
+    ];
+    return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
   }
 
   Future<void> _loadProfileData() async {
@@ -376,7 +509,11 @@ class _ProfileScreenState extends State<ProfileScreen>
     AvatarNotifier.instance.removeListener(_onAvatarChanged);
     PetAvatarNotifier.instance.removeListener(_onPetAvatarChanged);
     _tabController.dispose();
+    _nestedScrollController.removeListener(_onScroll);
+    _nestedScrollController.dispose();
     _friendshipChannel?.unsubscribe();
+    // Restore nav bar when leaving this screen
+    navBarVisibleNotifier.value = true;
     super.dispose();
   }
 
@@ -439,9 +576,9 @@ class _ProfileScreenState extends State<ProfileScreen>
   }
 
   void _navigateToSettings() {
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute(builder: (_) => const ProfileSettingsScreen()));
+    Navigator.of(context)
+        .push(MaterialPageRoute(builder: (_) => const ProfileSettingsScreen()))
+        .then((_) => _loadOwnSettings());
   }
 
   @override
@@ -455,6 +592,7 @@ class _ProfileScreenState extends State<ProfileScreen>
       body: SafeArea(
         bottom: false,
         child: NestedScrollView(
+          controller: _nestedScrollController,
           headerSliverBuilder: (context, innerBoxIsScrolled) => [
             SliverAppBar(
               backgroundColor: theme.scaffoldBackgroundColor,
@@ -499,10 +637,29 @@ class _ProfileScreenState extends State<ProfileScreen>
                       ),
                     ],
                   ),
+                // Heart icon — visible only on own profile
                 IconButton(
-                  onPressed: _navigateToDiary,
-                  icon: const Icon(Icons.book_outlined),
-                  tooltip: 'Diário',
+                  tooltip: 'Saúde & Emergência',
+                  icon: Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: const BoxDecoration(
+                      color: Color(0xFFFFE4E6),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.favorite_rounded,
+                      color: Color(0xFFE11D48),
+                      size: 18,
+                    ),
+                  ),
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const HealthEmergencyScreen(),
+                      ),
+                    );
+                  },
                 ),
                 IconButton(
                   onPressed: _navigateToSettings,
@@ -519,9 +676,13 @@ class _ProfileScreenState extends State<ProfileScreen>
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
                 child: HyperfocusSectionWidget(
-                  hyperfocuses: (_profileData['hyperfocuses'] as List)
-                      .cast<Map<String, dynamic>>(),
-                  interests: (_profileData['interests'] as List).cast<String>(),
+                  hyperfocuses: _showHyperfocuses
+                      ? (_profileData['hyperfocuses'] as List)
+                            .cast<Map<String, dynamic>>()
+                      : const [],
+                  interests: _showInterests
+                      ? (_profileData['interests'] as List).cast<String>()
+                      : const [],
                 ),
               ),
             ),
@@ -540,7 +701,26 @@ class _ProfileScreenState extends State<ProfileScreen>
                   ),
                   tabs: const [
                     Tab(text: 'Publicações'),
-                    Tab(text: 'Salvos'),
+                    Tab(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.book_outlined, size: 16),
+                          SizedBox(width: 4),
+                          Text('Diário'),
+                        ],
+                      ),
+                    ),
+                    Tab(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.bookmark_outline_rounded, size: 16),
+                          SizedBox(width: 4),
+                          Text('Salvos'),
+                        ],
+                      ),
+                    ),
                   ],
                 ),
                 theme.colorScheme.surface,
@@ -555,6 +735,7 @@ class _ProfileScreenState extends State<ProfileScreen>
                 author: _profileData,
                 bottomPadding: listBottomPadding,
               ),
+              _buildDiaryTab(theme, listBottomPadding),
               ProfilePostsGridWidget(
                 posts: _savedPostsMaps,
                 author: _profileData,
@@ -725,61 +906,65 @@ class _ProfileScreenState extends State<ProfileScreen>
                     Positioned(
                       bottom: 0,
                       right: 0,
-                      child: GestureDetector(
-                        onTap: () {
-                          final petUrl =
-                              _profileData['petAvatarUrl'] as String?;
-                          if (petUrl != null && petUrl.isNotEmpty) {
-                            _openPetPhotoFullscreen();
-                          } else {
-                            _navigateToEditProfile();
-                          }
-                        },
-                        child: Hero(
-                          tag: 'pet_badge_photo',
-                          child: Container(
-                            width: 34,
-                            height: 34,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              border: Border.all(
-                                color: Theme.of(
-                                  context,
-                                ).scaffoldBackgroundColor,
-                                width: 2,
-                              ),
-                              color: AppTheme.primary.withAlpha(30),
-                            ),
-                            child: ClipOval(
-                              child:
-                                  (_profileData['petAvatarUrl'] as String?) !=
-                                          null &&
-                                      (_profileData['petAvatarUrl'] as String)
-                                          .isNotEmpty
-                                  ? CustomImageWidget(
-                                      key: ValueKey(
-                                        _profileData['petAvatarUrl'],
-                                      ),
-                                      imageUrl:
-                                          _profileData['petAvatarUrl']
-                                              as String,
-                                      width: 34,
-                                      height: 34,
-                                      fit: BoxFit.cover,
-                                      semanticLabel:
-                                          _profileData['petAvatarSemantic']
-                                              as String? ??
-                                          'Foto do pet',
-                                    )
-                                  : const Icon(
-                                      Icons.pets_rounded,
-                                      size: 18,
-                                      color: AppTheme.primary,
+                      child: _showPets
+                          ? GestureDetector(
+                              onTap: () {
+                                final petUrl =
+                                    _profileData['petAvatarUrl'] as String?;
+                                if (petUrl != null && petUrl.isNotEmpty) {
+                                  _openPetPhotoFullscreen();
+                                } else {
+                                  _navigateToEditProfile();
+                                }
+                              },
+                              child: Hero(
+                                tag: 'pet_badge_photo',
+                                child: Container(
+                                  width: 34,
+                                  height: 34,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: Theme.of(
+                                        context,
+                                      ).scaffoldBackgroundColor,
+                                      width: 2,
                                     ),
-                            ),
-                          ),
-                        ),
-                      ),
+                                    color: AppTheme.primary.withAlpha(30),
+                                  ),
+                                  child: ClipOval(
+                                    child:
+                                        (_profileData['petAvatarUrl']
+                                                    as String?) !=
+                                                null &&
+                                            (_profileData['petAvatarUrl']
+                                                    as String)
+                                                .isNotEmpty
+                                        ? CustomImageWidget(
+                                            key: ValueKey(
+                                              _profileData['petAvatarUrl'],
+                                            ),
+                                            imageUrl:
+                                                _profileData['petAvatarUrl']
+                                                    as String,
+                                            width: 34,
+                                            height: 34,
+                                            fit: BoxFit.cover,
+                                            semanticLabel:
+                                                _profileData['petAvatarSemantic']
+                                                    as String? ??
+                                                'Foto do pet',
+                                          )
+                                        : const Icon(
+                                            Icons.pets_rounded,
+                                            size: 18,
+                                            color: AppTheme.primary,
+                                          ),
+                                  ),
+                                ),
+                              ),
+                            )
+                          : const SizedBox.shrink(),
                     ),
                   ],
                 ),
@@ -850,7 +1035,7 @@ class _ProfileScreenState extends State<ProfileScreen>
                     _profileData['bio'] as String,
                     style: theme.textTheme.bodyMedium?.copyWith(height: 1.5),
                   ),
-                if (_profileData['petName'] != null) ...[
+                if (_showPets && _profileData['petName'] != null) ...[
                   const SizedBox(height: 8),
                   Row(
                     children: [
@@ -905,6 +1090,185 @@ class _ProfileScreenState extends State<ProfileScreen>
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildDiaryTab(ThemeData theme, double bottomPadding) {
+    if (_diaryEntries.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.book_outlined,
+              size: 48,
+              color: theme.colorScheme.onSurfaceVariant.withAlpha(100),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Nenhuma entrada no diário',
+              style: GoogleFonts.inter(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontSize: 14,
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextButton(
+              onPressed: _navigateToDiary,
+              child: Text(
+                'Abrir Diário',
+                style: GoogleFonts.inter(
+                  color: AppTheme.primary,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return ListView.builder(
+      padding: EdgeInsets.fromLTRB(16, 12, 16, bottomPadding),
+      itemCount: _diaryEntries.length + 1,
+      itemBuilder: (context, index) {
+        if (index == 0) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton.icon(
+                  onPressed: _navigateToDiary,
+                  icon: const Icon(Icons.open_in_new_rounded, size: 14),
+                  label: Text(
+                    'Ver tudo',
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  style: TextButton.styleFrom(
+                    foregroundColor: AppTheme.primary,
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+        final entry = _diaryEntries[index - 1];
+        return _buildDiaryEntryCard(entry, theme);
+      },
+    );
+  }
+
+  Widget _buildDiaryEntryCard(Map<String, dynamic> entry, ThemeData theme) {
+    final mood = entry['mood'] as String? ?? '🌟';
+    final title = entry['title'] as String? ?? '';
+    final content = entry['content'] as String? ?? '';
+    final date = entry['date'] as String? ?? '';
+    final isPrivate = entry['is_private'] as bool? ?? true;
+    final tags = (entry['tags'] as List?)?.cast<String>() ?? [];
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: theme.colorScheme.outline.withAlpha(30)),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: _navigateToDiary,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Text(mood, style: const TextStyle(fontSize: 22)),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (title.isNotEmpty)
+                          Text(
+                            title,
+                            style: GoogleFonts.inter(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 14,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        Text(
+                          date,
+                          style: GoogleFonts.inter(
+                            fontSize: 11,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (isPrivate)
+                    Icon(
+                      Icons.lock_outline_rounded,
+                      size: 14,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                ],
+              ),
+              if (content.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Text(
+                  content,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: theme.colorScheme.onSurface.withAlpha(200),
+                    height: 1.5,
+                  ),
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+              if (tags.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: tags
+                      .take(3)
+                      .map(
+                        (tag) => Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppTheme.primary.withAlpha(20),
+                            borderRadius: BorderRadius.circular(100),
+                          ),
+                          child: Text(
+                            '#$tag',
+                            style: GoogleFonts.inter(
+                              fontSize: 11,
+                              color: AppTheme.primary,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }

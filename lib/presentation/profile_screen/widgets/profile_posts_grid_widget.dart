@@ -33,7 +33,14 @@ class ProfilePostsGridWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    if (posts.isEmpty) {
+
+    // Only show posts that have an actual image
+    final photoPosts = posts.where((p) {
+      final imageUrl = p['imageUrl'] as String?;
+      return imageUrl != null && imageUrl.isNotEmpty;
+    }).toList();
+
+    if (photoPosts.isEmpty) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(40),
@@ -64,10 +71,9 @@ class ProfilePostsGridWidget extends StatelessWidget {
         mainAxisSpacing: 4,
         childAspectRatio: 1,
       ),
-      itemCount: posts.length,
+      itemCount: photoPosts.length,
       itemBuilder: (context, index) {
-        final post = posts[index];
-        final hasImage = post['hasImage'] as bool;
+        final post = photoPosts[index];
 
         return ClipRRect(
           borderRadius: BorderRadius.circular(8),
@@ -75,24 +81,13 @@ class ProfilePostsGridWidget extends StatelessWidget {
             color: Colors.transparent,
             child: InkWell(
               onTap: () => _openPostDetail(context, post),
-              child: hasImage
-                  ? CustomImageWidget(
-                      imageUrl: post['imageUrl'] as String,
-                      width: double.infinity,
-                      height: double.infinity,
-                      fit: BoxFit.cover,
-                      semanticLabel: post['semanticLabel'] as String,
-                    )
-                  : Container(
-                      color: theme.colorScheme.surfaceContainerHighest,
-                      child: Center(
-                        child: Icon(
-                          Icons.article_outlined,
-                          color: theme.colorScheme.onSurfaceVariant,
-                          size: 28,
-                        ),
-                      ),
-                    ),
+              child: CustomImageWidget(
+                imageUrl: post['imageUrl'] as String,
+                width: double.infinity,
+                height: double.infinity,
+                fit: BoxFit.cover,
+                semanticLabel: post['semanticLabel'] as String? ?? '',
+              ),
             ),
           ),
         );

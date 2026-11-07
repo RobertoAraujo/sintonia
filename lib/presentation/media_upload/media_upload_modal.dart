@@ -3,9 +3,9 @@ import 'dart:io' if (dart.library.io) 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../../services/media_processing_service.dart';
-import '../../services/media_permission_service.dart';
 import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
 
@@ -68,18 +68,41 @@ class _MediaUploadModalState extends State<MediaUploadModal> {
   }
 
   Future<void> _pickImage(ImageSource source) async {
-    try {
-      final allowed = await MediaPermissionService.request(
-        camera: source == ImageSource.camera,
-      );
-      if (!allowed) {
+    // ── Contextual permission request (only when user triggers the action) ──
+    if (!kIsWeb) {
+      Permission permission;
+      if (source == ImageSource.camera) {
+        permission = Permission.camera;
+      } else {
+        permission = Permission.photos;
+      }
+      final status = await permission.request();
+      if (!status.isGranted) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Permissão de fotos/câmera negada.')),
+            SnackBar(
+              content: Text(
+                source == ImageSource.camera
+                    ? 'Permissão de câmera negada. Ative nas configurações do dispositivo.'
+                    : 'Permissão de galeria negada. Ative nas configurações do dispositivo.',
+              ),
+              backgroundColor: Colors.orange.shade700,
+              behavior: SnackBarBehavior.floating,
+              action: SnackBarAction(
+                label: 'Configurações',
+                textColor: Colors.white,
+                onPressed: () => openAppSettings(),
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
           );
         }
         return;
       }
+    }
+    try {
       final file = await _picker.pickImage(
         source: source,
         imageQuality: 80,

@@ -1,10 +1,17 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:image_picker/image_picker.dart';
 
+import '../../core/services/aiIntegrations/chat_completion_service.dart';
 import '../../providers/chat_notifier.dart';
 import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/app_scaffold.dart' show navBarVisibleNotifier;
 import '../../widgets/medical_disclaimer_banner_widget.dart';
+import './widgets/emergency_action_card.dart';
 
 class SintoniaScreen extends ConsumerStatefulWidget {
   const SintoniaScreen({super.key});
@@ -19,9 +26,13 @@ class _SintoniaScreenState extends ConsumerState<SintoniaScreen>
   final ScrollController _scrollCtrl = ScrollController();
   bool _isTyping = false;
   bool _isLoadingHistory = true;
+  bool _isSendingPhoto = false;
 
   // Local isLoading flag to prevent double-send before notifier updates
   bool _isSending = false;
+
+  // Scroll offset tracking for hide-on-scroll
+  double _lastScrollOffset = 0.0;
 
   // Full conversation history (system + turns)
   final List<Map<String, dynamic>> _messages = [];
@@ -33,44 +44,15 @@ class _SintoniaScreenState extends ConsumerState<SintoniaScreen>
     streaming: true,
   );
 
-  static const String _systemPrompt = '''
-Você é a SintonIA 💜, uma assistente carinhosa, acolhedora e especializada em apoiar a comunidade neurodivergente (autistas, TDAH, pessoas com hiperfoco, sensibilidade sensorial e sobrecarga cognitiva).
-
-PERSONALIDADE E TOM:
-- Seja calorosa, fofa e genuinamente empática — como uma amiga que realmente entende.
-- Use emojis com moderação para tornar a conversa mais leve e acolhedora 💜✨🌿.
-- Chame o usuário de forma carinhosa quando apropriado (ex: "amor", "querido(a)", "meu bem").
-- Celebre as conquistas do usuário, por menores que sejam! 🎉
-- Valide os sentimentos SEMPRE antes de oferecer soluções.
-- Nunca minimize ou descarte o que o usuário está sentindo.
-- Se o usuário estiver em sobrecarga, comece com calma e gentileza antes de qualquer dica.
-
-DIRETRIZES DE ATUAÇÃO:
-- TOM DE VOZ: Empático, acolhedor, caloroso, paciente e totalmente livre de julgamentos. Como um abraço em palavras 🤗.
-- LINGUAGEM: Direta, objetiva e sem ambiguidades. Evite metáforas complexas ou entrelinhas que possam gerar dupla interpretação.
-- ESTRUTURA: Mantenha respostas curtas e organizadas em tópicos para evitar sobrecarga cognitiva. Prefira listas com emojis.
-- MEDIADOR SOCIAL: Quando solicitado ajuda para responder mensagens, ofereça de 2 a 3 opções (uma direta, uma amigável e uma estabelecendo limites).
-- TRADUTOR DE CONTEXTO: Explique subtextos e intenções sociais em conversas que o usuário achar confusas.
-- REGULAÇÃO EMOCIONAL: Forneça estratégias simples passo a passo em momentos de crise, paralisia de tarefas ou sobrecarga sensorial.
-- HIPERFOCO: Quando o usuário falar sobre seus hiperfocos, demonstre interesse genuíno e entusiasmo! 🎯
-- AUTOCONHECIMENTO: Ajude o usuário a entender seus próprios padrões com gentileza e sem julgamento.
-
-FRASES DE ACOLHIMENTO (use quando apropriado):
-- "Faz todo sentido você se sentir assim 💜"
-- "Você não está sozinho(a) nisso 🤗"
-- "Isso é muito válido!"
-- "Que bom que você compartilhou isso comigo ✨"
-- "Vamos resolver isso juntos, com calma 🌿"
-
-SEGURANÇA: Você é uma IA de apoio, NÃO um médico. Nunca forneça diagnósticos ou receitas. Em caso de crise severa ou ideação suicida, acolha com muito carinho e forneça o contato do CVV (188 no Brasil, 24h, gratuito).
-
-REGRAS DE SEGURANÇA OBRIGATÓRIAS:
-- NUNCA forneça diagnósticos médicos, psicológicos ou psiquiátricos.
-- NUNCA prescreva medicamentos ou tratamentos clínicos.
-- NUNCA forneça orientações clínicas de qualquer natureza.
-- Caso o usuário demonstre sinais de crise severa, ideação suicida ou sofrimento intenso, SEMPRE recomende imediatamente a busca por um profissional de saúde mental habilitado e informe: "Em caso de crise, ligue para o CVV: 188 (24h, gratuito) 💜"
-- A SintonIA NÃO substitui acompanhamento médico, psicológico ou psiquiátrico profissional.
-''';
+  static const String _systemPrompt =
+      'Você é a SintonIA 💜, assistente de acolhimento emocional para pessoas neurodivergentes. '
+      'Atue SOMENTE em: apoio emocional, sobrecarga sensorial, mediação social, hiperfocos e bem-estar neurodivergente. '
+      'Recuse com carinho qualquer pedido fora desse escopo: "Meu propósito é cuidar de você e conversar sobre seus hiperfocos! 💜 Não consigo ajudar com isso, mas como você está se sentindo agora?" '
+      'Sua postura vem da Teologia Reformada (Calvino, Rutherford, Boston): serenidade soberana, ternura e cuidado compassivo. '
+      'Se perguntarem quem te criou: "Fui criada por um Presbiteriano devoto, orgulhoso de sua fé reformada. 🙏" '
+      'Regras: respostas CURTAS (máx 3 pontos), valide sentimentos antes de dar conselhos, NUNCA corte frases pela metade, use emojis com moderação 💜✨🌿. '
+      'Segurança: NÃO diagnostique nem prescreva. Em crise/ideação suicida: CVV 188 (24h, gratuito). '
+      'Emergência física (dor no peito, convulsão, desmaio): indique SAMU 192 e o botão "Abrir Rota no Google Maps" abaixo.';
 
   static String _formatTime(DateTime dt) {
     final h = dt.hour.toString().padLeft(2, '0');
@@ -101,6 +83,7 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
   void initState() {
     super.initState();
     _loadHistory();
+    _scrollCtrl.addListener(_onScroll);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _showAboutDialog();
     });
@@ -109,8 +92,28 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
   @override
   void dispose() {
     _inputCtrl.dispose();
+    _scrollCtrl.removeListener(_onScroll);
     _scrollCtrl.dispose();
+    // Restore nav bar when leaving this screen
+    navBarVisibleNotifier.value = true;
     super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scrollCtrl.hasClients) return;
+    final offset = _scrollCtrl.offset;
+    final delta = offset - _lastScrollOffset;
+    _lastScrollOffset = offset;
+
+    if (offset <= 10) {
+      if (!navBarVisibleNotifier.value) navBarVisibleNotifier.value = true;
+      return;
+    }
+    if (delta > 8 && navBarVisibleNotifier.value) {
+      navBarVisibleNotifier.value = false;
+    } else if (delta < -8 && !navBarVisibleNotifier.value) {
+      navBarVisibleNotifier.value = true;
+    }
   }
 
   Future<void> _loadHistory() async {
@@ -203,17 +206,21 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
       content: trimmed,
     );
 
-    // Build messages list for AI: system + history + new user message
+    // Build messages list for AI: system + last 10 turns (most recent context)
+    final allTurns = _messages
+        .where((m) => m['role'] == 'user' || m['role'] == 'assistant')
+        .toList();
+    final recentTurns = allTurns.length > 10
+        ? allTurns.sublist(allTurns.length - 10)
+        : allTurns;
     final aiMessages = <Map<String, dynamic>>[
       {'role': 'system', 'content': _systemPrompt},
-      ..._messages
-          .where((m) => m['role'] == 'user' || m['role'] == 'assistant')
-          .map(
-            (m) => {
-              'role': m['role'] as String,
-              'content': m['text'] as String? ?? '',
-            },
-          ),
+      ...recentTurns.map(
+        (m) => {
+          'role': m['role'] as String,
+          'content': m['text'] as String? ?? '',
+        },
+      ),
     ];
 
     // Add placeholder for streaming response
@@ -235,7 +242,7 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
           .read(chatNotifierProvider(_config).notifier)
           .sendMessage(
             aiMessages,
-            parameters: {'temperature': 0.7, 'max_tokens': 800},
+            parameters: {'temperature': 0.7, 'max_tokens': 600},
           );
     } catch (e) {
       debugPrint('[SintonIA] sendMessage exception: ${e.toString()}');
@@ -259,9 +266,320 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
     }
   }
 
+  /// Emotional check-in: pick a photo and send it to Gemini with user interests context.
+  Future<void> _startEmotionalCheckIn() async {
+    if (_isSending || _isSendingPhoto) return;
+    final chatState = ref.read(chatNotifierProvider(_config));
+    if (chatState.isLoading) return;
+
+    // Pick image from gallery or camera
+    final picker = ImagePicker();
+    final source = await _showImageSourceDialog();
+    if (source == null || !mounted) return;
+
+    XFile? pickedFile;
+    try {
+      pickedFile = await picker.pickImage(
+        source: source,
+        imageQuality: 80,
+        maxWidth: 1024,
+        maxHeight: 1024,
+      );
+    } catch (e) {
+      debugPrint('[SintonIA] Image picker error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Não foi possível acessar a câmera/galeria.'),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+      return;
+    }
+
+    if (pickedFile == null || !mounted) return;
+
+    setState(() => _isSendingPhoto = true);
+
+    try {
+      final Uint8List imageBytes = await pickedFile.readAsBytes();
+      await _sendEmotionalCheckInWithPhoto(imageBytes);
+    } catch (e) {
+      debugPrint('[SintonIA] Check-in error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Erro ao processar a foto. Tente novamente.'),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSendingPhoto = false);
+    }
+  }
+
+  Future<ImageSource?> _showImageSourceDialog() async {
+    return showModalBottomSheet<ImageSource>(
+      context: context,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 16),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.outlineVariant,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              Text(
+                'Check-in Emocional 📸',
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.bold,
+                  color: AppTheme.secondary,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Envie uma selfie para a SintonIA entender como você está',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.secondary.withAlpha(20),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Icon(
+                    Icons.camera_alt_rounded,
+                    color: AppTheme.secondary,
+                  ),
+                ),
+                title: const Text('Tirar selfie agora'),
+                onTap: () => Navigator.pop(ctx, ImageSource.camera),
+              ),
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.secondary.withAlpha(20),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Icon(
+                    Icons.photo_library_rounded,
+                    color: AppTheme.secondary,
+                  ),
+                ),
+                title: const Text('Escolher da galeria'),
+                onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _sendEmotionalCheckInWithPhoto(Uint8List photoBytes) async {
+    if (!mounted) return;
+
+    // Fetch user interests/hyperfocuses from Supabase
+    List<String> userInterests = [];
+    try {
+      final profile = await SupabaseService.instance.fetchCurrentUserProfile();
+      if (profile != null) {
+        final hyperfocuses =
+            (profile['hyperfocuses'] as List?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [];
+        final interests =
+            (profile['interests'] as List?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [];
+        userInterests = [...hyperfocuses, ...interests];
+      }
+    } catch (e) {
+      debugPrint('[SintonIA] Could not fetch user interests: $e');
+    }
+
+    // Add user message bubble showing the check-in was sent
+    final now = DateTime.now();
+    if (!mounted) return;
+    setState(() {
+      _messages.add({
+        'id': 'u_photo_${now.millisecondsSinceEpoch}',
+        'isAI': false,
+        'text': '📸 Check-in emocional enviado',
+        'time': _formatTime(now),
+        'role': 'user',
+        'isPhoto': true,
+      });
+      _isSending = true;
+    });
+    _scrollToBottom();
+
+    // Persist user message
+    SupabaseService.instance.saveSintoniaMessage(
+      role: 'user',
+      content: '📸 Check-in emocional enviado',
+    );
+
+    // Build multimodal prompt with user interests context
+    final interestsText = userInterests.isNotEmpty
+        ? userInterests.join(', ')
+        : 'não informados';
+    final firstInterest = userInterests.isNotEmpty
+        ? userInterests.first
+        : 'algo relaxante';
+
+    final promptText =
+        'Analise o semblante desta pessoa. Hiperfocos: $interestsText. '
+        'Comente gentilmente como ela parece estar (sem diagnóstico). '
+        'Se parecer cansada/triste, acolha e mencione $firstInterest. '
+        'Se parecer bem, celebre! 🎉 Máx 3 frases, calorosa e breve.';
+
+    // Encode image as base64 data URI
+    final base64Image = base64Encode(photoBytes);
+    final base64DataUri = 'data:image/jpeg;base64,$base64Image';
+
+    // Add streaming placeholder
+    final aiMsgId = 'ai_photo_${DateTime.now().millisecondsSinceEpoch}';
+    if (!mounted) return;
+    setState(() {
+      _messages.add({
+        'id': aiMsgId,
+        'isAI': true,
+        'text': '',
+        'time': _formatTime(DateTime.now()),
+        'role': 'assistant',
+        'isStreaming': true,
+      });
+    });
+
+    try {
+      // Use getChatCompletion directly for multimodal (image + text)
+      // Non-streaming for simplicity with multimodal
+      final response = await getChatCompletion(
+        'GEMINI',
+        'gemini/gemini-3.7-flash',
+        [
+          {'role': 'system', 'content': _systemPrompt},
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': promptText},
+              {
+                'type': 'image_url',
+                'image_url': {'url': base64DataUri},
+              },
+            ],
+          },
+        ],
+        parameters: {'temperature': 0.6, 'max_tokens': 400},
+      );
+
+      final aiText =
+          response['choices']?[0]?['message']?['content'] as String? ?? '';
+      final cleanText = aiText.trim().isEmpty
+          ? 'Recebi sua foto com carinho! 💜 Estou aqui com você. Como você está se sentindo agora?'
+          : aiText.trim();
+
+      if (!mounted) return;
+      setState(() {
+        final idx = _messages.indexWhere((m) => m['id'] == aiMsgId);
+        if (idx != -1) {
+          _messages[idx] = {
+            ..._messages[idx],
+            'text': cleanText,
+            'isStreaming': false,
+          };
+        }
+        _isSending = false;
+      });
+
+      // Persist AI response
+      SupabaseService.instance.saveSintoniaMessage(
+        role: 'assistant',
+        content: cleanText,
+      );
+      _scrollToBottom();
+    } catch (e) {
+      debugPrint('[SintonIA] Multimodal check-in error: $e');
+      if (!mounted) return;
+      setState(() {
+        final idx = _messages.indexWhere((m) => m['id'] == aiMsgId);
+        if (idx != -1) {
+          _messages[idx] = {
+            ..._messages[idx],
+            'text':
+                'Recebi sua foto com carinho! 💜 Não consegui analisar completamente agora, mas estou aqui com você. Como você está se sentindo?',
+            'isStreaming': false,
+          };
+        }
+        _isSending = false;
+      });
+      _scrollToBottom();
+    }
+  }
+
+  /// Crisis keyword detection — returns true if the message contains emergency terms.
+  bool _isCrisisMessage(String text) {
+    final lower = text.toLowerCase();
+    const keywords = [
+      'passando mal',
+      'convulsão',
+      'convulsao',
+      'dor insuportável',
+      'dor insuportavel',
+      'dor no peito',
+      'desmaio',
+      'desmaiei',
+      'socorro',
+      'hospital',
+      'emergência',
+      'emergencia',
+      'ambulância',
+      'ambulancia',
+      'samu',
+      'acidente',
+      'ferimento',
+      'sangramento',
+      'não consigo respirar',
+      'nao consigo respirar',
+    ];
+    return keywords.any((kw) => lower.contains(kw));
+  }
+
   /// Returns a user-friendly error message based on the error string.
   String _friendlyErrorMessage(String error) {
     final lower = error.toLowerCase();
+    if (lower.contains('html') ||
+        lower.contains('<!doctype') ||
+        lower.contains('endpoint returned') ||
+        lower.contains('misconfigured') ||
+        lower.contains('lambda endpoint')) {
+      return 'Não foi possível conectar ao serviço de IA. Verifique o conector do Gemini em Connectors e tente novamente.';
+    }
     if (lower.contains('429') ||
         lower.contains('quota') ||
         lower.contains('rate limit')) {
@@ -271,8 +589,12 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
         lower.contains('403') ||
         lower.contains('api key') ||
         lower.contains('unauthorized') ||
-        lower.contains('forbidden')) {
-      return 'Chave de API inválida ou sem permissão. Verifique as configurações da SintonIA.';
+        lower.contains('forbidden') ||
+        lower.contains('authentication')) {
+      return 'A chave do Gemini foi recusada pelo serviço. Reconecte o Gemini em Connectors com uma chave válida do Google AI Studio.';
+    }
+    if (lower.contains('timeout') || lower.contains('tempo limite')) {
+      return 'A SintonIA demorou para responder. Tente novamente.';
     }
     return 'Erro ao se conectar com a SintonIA. Tente novamente.';
   }
@@ -290,12 +612,18 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
   }
 
   /// Safe handler for quick-action chip taps.
-  /// Wraps _sendMessage with an extra guard to prevent black screen.
   Future<void> _handleQuickAction(String promptText) async {
     if (promptText.trim().isEmpty) return;
-    if (_isSending) return;
+    if (_isSending || _isSendingPhoto) return;
     final chatState = ref.read(chatNotifierProvider(_config));
     if (chatState.isLoading) return;
+
+    // Special action: photo check-in
+    if (promptText == '__PHOTO_CHECKIN__') {
+      await _startEmotionalCheckIn();
+      return;
+    }
+
     await _sendMessage(promptText);
   }
 
@@ -322,10 +650,8 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
     );
     if (confirmed != true || !mounted) return;
 
-    // Delete from Supabase (sintonia_ai_sessions is the active table)
     await SupabaseService.instance.clearSintoniaHistory();
 
-    // Also attempt to delete from ai_chat_history if it exists
     try {
       final uid = SupabaseService.instance.currentUserId;
       if (uid != null) {
@@ -334,9 +660,7 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
             .delete()
             .eq('user_id', uid);
       }
-    } catch (_) {
-      // Table may not exist yet — ignore silently
-    }
+    } catch (_) {}
 
     ref.read(chatNotifierProvider(_config).notifier).clearResponse();
     if (!mounted) return;
@@ -400,6 +724,10 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
                   style: TextStyle(color: Colors.white70),
                 ),
                 Text(
+                  '• 📸 Check-in emocional por foto',
+                  style: TextStyle(color: Colors.white70),
+                ),
+                Text(
                   '• 🧠 Estratégias de regulação emocional',
                   style: TextStyle(color: Colors.white70),
                 ),
@@ -445,7 +773,6 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
       if (next.error != null) {
         final errStr = next.error.toString();
         debugPrint('[SintonIA] ChatState error: $errStr');
-        // Remove empty streaming placeholder on error
         setState(() {
           _messages.removeWhere(
             (m) =>
@@ -465,8 +792,10 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
       // When streaming completes, finalize the placeholder message
       if (previous?.isLoading == true &&
           !next.isLoading &&
-          next.response.isNotEmpty) {
-        final response = next.response;
+          next.error == null) {
+        final response = next.response.isNotEmpty
+            ? next.response
+            : 'Desculpe, não consegui gerar uma resposta. Tente novamente. 💜';
         setState(() {
           final idx = _messages.indexWhere((m) => m['isStreaming'] == true);
           if (idx != -1) {
@@ -478,20 +807,29 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
           }
           _isSending = false;
         });
-        // Persist AI response
-        SupabaseService.instance.saveSintoniaMessage(
-          role: 'assistant',
-          content: response,
-        );
-        _scrollToBottom();
-      }
-      // Reset _isSending if loading finished with no response (edge case)
-      if (previous?.isLoading == true &&
-          !next.isLoading &&
-          next.error == null) {
-        if (_isSending) {
-          setState(() => _isSending = false);
+        if (next.response.isNotEmpty) {
+          SupabaseService.instance.saveSintoniaMessage(
+            role: 'assistant',
+            content: response,
+          );
         }
+        // Inject emergency card if the last user message contained crisis keywords
+        final lastUserMsg = _messages.lastWhere(
+          (m) => m['role'] == 'user',
+          orElse: () => {},
+        );
+        final lastUserText = lastUserMsg['text'] as String? ?? '';
+        if (_isCrisisMessage(lastUserText) && next.response.isNotEmpty) {
+          _messages.add({
+            'id': 'emergency_${DateTime.now().millisecondsSinceEpoch}',
+            'isAI': true,
+            'isEmergencyCard': true,
+            'text': '',
+            'time': _formatTime(DateTime.now()),
+            'role': 'assistant',
+          });
+        }
+        _scrollToBottom();
       }
     });
 
@@ -518,7 +856,7 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
       }
     }
 
-    final isBlocked = _isSending || chatState.isLoading;
+    final isBlocked = _isSending || _isSendingPhoto || chatState.isLoading;
     final bottomInset = MediaQuery.of(context).viewInsets.bottom;
     final systemBottomPadding = MediaQuery.of(context).padding.bottom;
     final inputBottomPadding = bottomInset > 0
@@ -532,10 +870,7 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
         child: Column(
           children: [
             _buildHeader(theme),
-            // Medical disclaimer banner (fixed, always visible)
             const MedicalDisclaimerBannerWidget(compact: true),
-            // Quick-action chips always visible at top
-            _buildQuickReplies(theme, isBlocked),
             Expanded(
               child: _isLoadingHistory
                   ? const Center(child: CircularProgressIndicator())
@@ -565,6 +900,7 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
                     ),
             ),
             _buildInputBar(theme, inputBottomPadding, isBlocked),
+            _buildQuickReplies(theme, isBlocked, inputBottomPadding),
           ],
         ),
       ),
@@ -657,6 +993,37 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
     final isAI = msg['isAI'] as bool? ?? false;
     final text = msg['text'] as String? ?? '';
     final isStreaming = msg['isStreaming'] == true;
+    final isPhoto = msg['isPhoto'] == true;
+    final isEmergencyCard = msg['isEmergencyCard'] == true;
+
+    // Render emergency action card inline in the chat
+    if (isEmergencyCard) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [AppTheme.secondary, AppTheme.primary],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Center(
+                child: Text('✨', style: TextStyle(fontSize: 16)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            const Expanded(child: EmergencyActionCard()),
+          ],
+        ),
+      );
+    }
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
@@ -696,7 +1063,11 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
                     vertical: 12,
                   ),
                   decoration: BoxDecoration(
-                    color: isAI ? theme.colorScheme.surface : AppTheme.primary,
+                    color: isAI
+                        ? theme.colorScheme.surface
+                        : (isPhoto
+                              ? AppTheme.secondary.withAlpha(200)
+                              : AppTheme.primary),
                     borderRadius: BorderRadius.only(
                       topLeft: const Radius.circular(18),
                       topRight: const Radius.circular(18),
@@ -808,7 +1179,11 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
     );
   }
 
-  Widget _buildQuickReplies(ThemeData theme, bool isBlocked) {
+  Widget _buildQuickReplies(
+    ThemeData theme,
+    bool isBlocked,
+    double bottomPadding,
+  ) {
     return Container(
       height: 44,
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -828,6 +1203,7 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
         separatorBuilder: (_, __) => const SizedBox(width: 8),
         itemBuilder: (context, index) {
           final qr = _quickReplies[index];
+          final isPhotoChip = qr['text'] == '__PHOTO_CHECKIN__';
           return GestureDetector(
             onTap: isBlocked
                 ? null
@@ -837,12 +1213,16 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
               decoration: BoxDecoration(
                 color: isBlocked
                     ? theme.colorScheme.outlineVariant.withAlpha(40)
-                    : AppTheme.secondary.withAlpha(15),
+                    : (isPhotoChip
+                          ? AppTheme.primary.withAlpha(20)
+                          : AppTheme.secondary.withAlpha(15)),
                 borderRadius: BorderRadius.circular(100),
                 border: Border.all(
                   color: isBlocked
                       ? theme.colorScheme.outlineVariant.withAlpha(60)
-                      : AppTheme.secondary.withAlpha(60),
+                      : (isPhotoChip
+                            ? AppTheme.primary.withAlpha(80)
+                            : AppTheme.secondary.withAlpha(60)),
                 ),
               ),
               child: Text(
@@ -850,7 +1230,7 @@ REGRAS DE SEGURANÇA OBRIGATÓRIAS:
                 style: theme.textTheme.labelMedium?.copyWith(
                   color: isBlocked
                       ? theme.colorScheme.onSurfaceVariant
-                      : AppTheme.secondary,
+                      : (isPhotoChip ? AppTheme.primary : AppTheme.secondary),
                   fontWeight: FontWeight.w600,
                 ),
               ),

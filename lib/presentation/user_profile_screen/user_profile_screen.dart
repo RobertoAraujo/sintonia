@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../services/supabase_service.dart';
+import '../../services/user_settings_service.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/custom_image_widget.dart';
 import '../chat_screen/widgets/private_chat_screen.dart';
@@ -23,6 +24,10 @@ class _UserProfileScreenState extends State<UserProfileScreen>
   _ConnectionStatus _connectionStatus = _ConnectionStatus.none;
   bool _isLoadingFriendship = true;
 
+  // ── Block state ───────────────────────────────────────────────────────────
+  bool _isBlockedByThem = false;
+  bool _isCheckingBlock = true;
+
   // ── Counters ──────────────────────────────────────────────────────────────
   int _postsCount = 0;
   int _friendsCount = 0;
@@ -38,22 +43,61 @@ class _UserProfileScreenState extends State<UserProfileScreen>
   List<Map<String, dynamic>> _posts = [];
   bool _isLoadingPosts = true;
 
+  // ── Diary entries ─────────────────────────────────────────────────────────
+  List<Map<String, dynamic>> _diaryEntries = [];
+  bool _isLoadingDiary = false;
+
   // ── Pet data ──────────────────────────────────────────────────────────────
   Map<String, dynamic>? _activePet;
+
+  // ── Privacy settings of the target user ──────────────────────────────────
+  bool _targetIsPublicProfile = true;
+  bool _targetShowHyperfocuses = true;
+  bool _targetShowInterests = true;
+  bool _targetShowPets = true;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
+    _tabController.addListener(_onTabChanged);
     _profileData = Map<String, dynamic>.from(widget.userData);
     _loadFullProfile();
     _checkFriendshipStatus();
+    _checkIfBlockedByThem();
     _loadCompatibilityScore();
     _loadUserPosts();
+    _loadTargetUserSettings();
+  }
+
+  Future<void> _loadTargetUserSettings() async {
+    final otherId = widget.userData['id'] as String?;
+    if (otherId == null) return;
+    try {
+      final settings = await UserSettingsService.instance.fetchSettingsForUser(
+        otherId,
+      );
+      if (!mounted) return;
+      setState(() {
+        _targetIsPublicProfile = settings['is_public_profile'] ?? true;
+        _targetShowHyperfocuses = settings['show_hyperfocus'] ?? true;
+        _targetShowInterests = settings['show_interests'] ?? true;
+        _targetShowPets = settings['show_pets'] ?? true;
+      });
+    } catch (_) {}
+  }
+
+  void _onTabChanged() {
+    if (_tabController.index == 1 &&
+        _diaryEntries.isEmpty &&
+        !_isLoadingDiary) {
+      _loadDiaryEntries();
+    }
   }
 
   @override
   void dispose() {
+    _tabController.removeListener(_onTabChanged);
     _tabController.dispose();
     super.dispose();
   }
@@ -223,6 +267,7 @@ class _UserProfileScreenState extends State<UserProfileScreen>
           .select()
           .eq('author_id', otherId)
           .eq('is_published', true)
+          .neq('post_type', 'diary')
           .order('created_at', ascending: false);
 
       final posts = (rows as List).map((p) {
@@ -260,6 +305,25 @@ class _UserProfileScreenState extends State<UserProfileScreen>
     }
   }
 
+  Future<void> _loadDiaryEntries() async {
+    final otherId = widget.userData['id'] as String?;
+    if (otherId == null) return;
+    setState(() => _isLoadingDiary = true);
+    try {
+      final rows = await SupabaseService.instance.fetchUserPublicDiaryEntries(
+        otherId,
+      );
+      if (mounted) {
+        setState(() {
+          _diaryEntries = rows;
+          _isLoadingDiary = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _isLoadingDiary = false);
+    }
+  }
+
   Future<void> _checkFriendshipStatus() async {
     final otherId = widget.userData['id'] as String?;
     final myId = SupabaseService.instance.currentUserId;
@@ -286,6 +350,31 @@ class _UserProfileScreenState extends State<UserProfileScreen>
       });
     } catch (_) {
       if (mounted) setState(() => _isLoadingFriendship = false);
+    }
+  }
+
+  Future<void> _checkIfBlockedByThem() async {
+    final otherId = widget.userData['id'] as String?;
+    final myId = SupabaseService.instance.currentUserId;
+    if (otherId == null || myId == null || otherId == myId) {
+      if (mounted) setState(() => _isCheckingBlock = false);
+      return;
+    }
+    try {
+      // Only check if THEY blocked ME (blocker = other user, blocked = me)
+      final results = await SupabaseService.instance.client
+          .from('blocked_users')
+          .select('id')
+          .eq('blocker_id', otherId)
+          .eq('blocked_user_id', myId);
+      if (mounted) {
+        setState(() {
+          _isBlockedByThem = (results as List).isNotEmpty;
+          _isCheckingBlock = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _isCheckingBlock = false);
     }
   }
 
@@ -607,6 +696,105 @@ class _UserProfileScreenState extends State<UserProfileScreen>
     final data = _profileData;
     final bottomPadding = MediaQuery.of(context).padding.bottom;
 
+    // Show blocked screen if the profile owner has blocked the current user
+    if (!_isCheckingBlock && _isBlockedByThem) {
+      return Scaffold(
+        backgroundColor: theme.scaffoldBackgroundColor,
+        appBar: AppBar(
+          backgroundColor: theme.scaffoldBackgroundColor,
+          elevation: 0,
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back_ios_new_rounded),
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+        ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.block_rounded,
+                  size: 72,
+                  color: theme.colorScheme.error.withAlpha(179),
+                ),
+                const SizedBox(height: 24),
+                Text(
+                  'Perfil indisponível',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Você não pode visualizar este perfil.',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: theme.colorScheme.onSurface.withAlpha(153),
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    // Show private profile screen if profile is not public and viewer is not a friend
+    final bool isFriend = _connectionStatus == _ConnectionStatus.connected;
+    final bool isMe =
+        SupabaseService.instance.currentUserId ==
+        (_profileData['id'] as String?);
+    if (!_targetIsPublicProfile &&
+        !isFriend &&
+        !isMe &&
+        !_isLoadingFriendship) {
+      return Scaffold(
+        backgroundColor: theme.scaffoldBackgroundColor,
+        appBar: AppBar(
+          backgroundColor: theme.scaffoldBackgroundColor,
+          elevation: 0,
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back_ios_new_rounded),
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+        ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.lock_rounded,
+                  size: 72,
+                  color: AppTheme.primary.withAlpha(179),
+                ),
+                const SizedBox(height: 24),
+                Text(
+                  'Perfil privado',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Este perfil é privado. Adicione esta pessoa como amiga para ver o conteúdo.',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: theme.colorScheme.onSurface.withAlpha(153),
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       backgroundColor: theme.scaffoldBackgroundColor,
       body: NestedScrollView(
@@ -732,6 +920,10 @@ class _UserProfileScreenState extends State<UserProfileScreen>
                 ),
                 tabs: const [
                   Tab(text: 'Publicações'),
+                  Tab(
+                    icon: Icon(Icons.menu_book_rounded, size: 18),
+                    text: 'Diário',
+                  ),
                   Tab(text: 'Sobre'),
                 ],
               ),
@@ -743,6 +935,7 @@ class _UserProfileScreenState extends State<UserProfileScreen>
           controller: _tabController,
           children: [
             _buildPostsTab(theme, bottomPadding),
+            _buildDiaryTab(theme, bottomPadding),
             _buildAboutTab(theme, data),
           ],
         ),
@@ -877,8 +1070,8 @@ class _UserProfileScreenState extends State<UserProfileScreen>
                     style: theme.textTheme.bodyMedium?.copyWith(height: 1.5),
                   ),
                 ],
-                // Active pet badge
-                if (_activePet != null) ...[
+                // Active pet badge — only shown if target user allows it
+                if (_targetShowPets && _activePet != null) ...[
                   const SizedBox(height: 8),
                   Row(
                     children: [
@@ -905,8 +1098,8 @@ class _UserProfileScreenState extends State<UserProfileScreen>
                       ),
                     ],
                   ),
-                ] else if ((data['petName'] as String?)?.isNotEmpty ==
-                    true) ...[
+                ] else if (_targetShowPets &&
+                    (data['petName'] as String?)?.isNotEmpty == true) ...[
                   const SizedBox(height: 8),
                   Row(
                     children: [
@@ -1134,8 +1327,14 @@ class _UserProfileScreenState extends State<UserProfileScreen>
 
   /// Returns the tags/badges section (hyperfocuses, interests) or null if empty
   Widget? _buildTagsSection(ThemeData theme, Map<String, dynamic> data) {
-    final hyperfocuses = (data['hyperfocuses'] as List?)?.cast<dynamic>() ?? [];
-    final interests = (data['interests'] as List?)?.cast<dynamic>() ?? [];
+    final rawHyperfocuses =
+        (data['hyperfocuses'] as List?)?.cast<dynamic>() ?? [];
+    final rawInterests = (data['interests'] as List?)?.cast<dynamic>() ?? [];
+    // Respect privacy settings
+    final hyperfocuses = _targetShowHyperfocuses
+        ? rawHyperfocuses
+        : <dynamic>[];
+    final interests = _targetShowInterests ? rawInterests : <dynamic>[];
     if (hyperfocuses.isEmpty && interests.isEmpty) return null;
 
     return Padding(
@@ -1218,7 +1417,10 @@ class _UserProfileScreenState extends State<UserProfileScreen>
     if (_isLoadingPosts) {
       return const Center(child: CircularProgressIndicator());
     }
-    if (_posts.isEmpty) {
+    final imagePosts = _posts
+        .where((p) => p['hasImage'] == true && p['imageUrl'] != null)
+        .toList();
+    if (imagePosts.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -1246,9 +1448,9 @@ class _UserProfileScreenState extends State<UserProfileScreen>
         crossAxisSpacing: 2,
         mainAxisSpacing: 2,
       ),
-      itemCount: _posts.length,
+      itemCount: imagePosts.length,
       itemBuilder: (_, i) {
-        final post = _posts[i];
+        final post = imagePosts[i];
         return ClipRRect(
           borderRadius: BorderRadius.zero,
           child: Material(
@@ -1271,21 +1473,337 @@ class _UserProfileScreenState extends State<UserProfileScreen>
                   ),
                 );
               },
-              child: post['hasImage'] == true && post['imageUrl'] != null
-                  ? Image.network(post['imageUrl'] as String, fit: BoxFit.cover)
-                  : Container(
-                      color: theme.colorScheme.surfaceContainerHighest,
-                      child: Center(
-                        child: Icon(
-                          Icons.article_outlined,
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ),
+              child: Image.network(
+                post['imageUrl'] as String,
+                fit: BoxFit.cover,
+              ),
             ),
           ),
         );
       },
+    );
+  }
+
+  // ── Diary tab ─────────────────────────────────────────────────────────────
+
+  Widget _buildDiaryTab(ThemeData theme, double bottomPadding) {
+    if (_isLoadingDiary) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_diaryEntries.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 80,
+                height: 80,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE8F5E9),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Icon(
+                  Icons.menu_book_rounded,
+                  size: 40,
+                  color: Color(0xFF1B4D3E),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Diário Privado',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Este usuário ainda não compartilhou\nnenhuma página do diário.',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  height: 1.5,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return ListView.builder(
+      padding: EdgeInsets.fromLTRB(16, 12, 16, bottomPadding + 80),
+      itemCount: _diaryEntries.length,
+      itemBuilder: (_, i) {
+        final entry = _diaryEntries[i];
+        final title = entry['title'] as String? ?? 'Sem título';
+        final content = entry['content'] as String? ?? '';
+        final mood = entry['mood'] as String? ?? '';
+        final tags = (entry['tags'] as List?)?.cast<String>() ?? [];
+        final createdAt = entry['created_at'] != null
+            ? DateTime.tryParse(entry['created_at'].toString())?.toLocal()
+            : null;
+        final dateStr = createdAt != null ? _formatDiaryDate(createdAt) : '';
+
+        return Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surface,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: theme.colorScheme.outlineVariant),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withAlpha(8),
+                blurRadius: 8,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(16),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(16),
+              onTap: () => _showDiaryEntryDetail(entry),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          width: 40,
+                          height: 40,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFE8F5E9),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Center(
+                            child: mood.isNotEmpty
+                                ? Text(
+                                    mood,
+                                    style: const TextStyle(fontSize: 20),
+                                  )
+                                : const Icon(
+                                    Icons.menu_book_rounded,
+                                    size: 20,
+                                    color: Color(0xFF1B4D3E),
+                                  ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                title,
+                                style: theme.textTheme.titleSmall?.copyWith(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              if (dateStr.isNotEmpty)
+                                Text(
+                                  dateStr,
+                                  style: theme.textTheme.labelSmall?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                        Icon(
+                          Icons.chevron_right_rounded,
+                          size: 18,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ],
+                    ),
+                    if (content.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        content,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          height: 1.5,
+                        ),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                    if (tags.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 4,
+                        children: tags.take(4).map((tag) {
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1B4D3E).withAlpha(15),
+                              borderRadius: BorderRadius.circular(100),
+                              border: Border.all(
+                                color: const Color(0xFF1B4D3E).withAlpha(50),
+                              ),
+                            ),
+                            child: Text(
+                              tag,
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: const Color(0xFF1B4D3E),
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  String _formatDiaryDate(DateTime dt) {
+    const months = [
+      'Jan',
+      'Fev',
+      'Mar',
+      'Abr',
+      'Mai',
+      'Jun',
+      'Jul',
+      'Ago',
+      'Set',
+      'Out',
+      'Nov',
+      'Dez',
+    ];
+    final hour = dt.hour.toString().padLeft(2, '0');
+    final min = dt.minute.toString().padLeft(2, '0');
+    return '${dt.day} ${months[dt.month - 1]} ${dt.year} • $hour:$min';
+  }
+
+  void _showDiaryEntryDetail(Map<String, dynamic> entry) {
+    final theme = Theme.of(context);
+    final title = entry['title'] as String? ?? 'Sem título';
+    final content = entry['content'] as String? ?? '';
+    final mood = entry['mood'] as String? ?? '';
+    final tags = (entry['tags'] as List?)?.cast<String>() ?? [];
+    final createdAt = entry['created_at'] != null
+        ? DateTime.tryParse(entry['created_at'].toString())?.toLocal()
+        : null;
+    final dateStr = createdAt != null ? _formatDiaryDate(createdAt) : '';
+
+    showModalBottomSheet(
+      context: context,
+      useRootNavigator: true,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.7,
+        maxChildSize: 0.95,
+        minChildSize: 0.4,
+        builder: (ctx, scrollCtrl) => Container(
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surface,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+          ),
+          child: Column(
+            children: [
+              Container(
+                margin: const EdgeInsets.only(top: 12, bottom: 8),
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.outlineVariant,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              Expanded(
+                child: ListView(
+                  controller: scrollCtrl,
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
+                  children: [
+                    Row(
+                      children: [
+                        if (mood.isNotEmpty)
+                          Text(mood, style: const TextStyle(fontSize: 32)),
+                        if (mood.isNotEmpty) const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            title,
+                            style: theme.textTheme.titleLarge?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (dateStr.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        dateStr,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                    if (tags.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 4,
+                        children: tags.map((tag) {
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1B4D3E).withAlpha(15),
+                              borderRadius: BorderRadius.circular(100),
+                              border: Border.all(
+                                color: const Color(0xFF1B4D3E).withAlpha(50),
+                              ),
+                            ),
+                            child: Text(
+                              tag,
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: const Color(0xFF1B4D3E),
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    const Divider(),
+                    const SizedBox(height: 16),
+                    Text(
+                      content,
+                      style: theme.textTheme.bodyMedium?.copyWith(height: 1.7),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
@@ -1460,8 +1978,8 @@ class _UserProfileScreenState extends State<UserProfileScreen>
           const SizedBox(height: 20),
         ],
 
-        // Active pet details
-        if (_activePet != null) ...[
+        // Active pet details — only shown if target user allows it
+        if (_targetShowPets && _activePet != null) ...[
           _SectionTitle(title: 'Pet Ativo', theme: theme),
           const SizedBox(height: 12),
           _PetCard(pet: _activePet!, theme: theme),

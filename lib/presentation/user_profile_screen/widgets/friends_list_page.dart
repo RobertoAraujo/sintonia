@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 import '../../../widgets/custom_image_widget.dart';
+import '../../chat_screen/widgets/private_chat_screen.dart';
 import '../../user_profile_screen/user_profile_screen.dart';
 
 /// Modal/page that shows the friends list of a given user.
@@ -24,6 +25,7 @@ class _FriendsListPageState extends State<FriendsListPage> {
   List<Map<String, dynamic>> _friends = [];
   bool _isLoading = true;
   String? _error;
+  final Set<String> _startingChat = {};
 
   @override
   void initState() {
@@ -80,6 +82,74 @@ class _FriendsListPageState extends State<FriendsListPage> {
     }
   }
 
+  Future<void> _startConversation(Map<String, dynamic> friend) async {
+    final friendId = friend['id'] as String? ?? '';
+    if (friendId.isEmpty) return;
+
+    setState(() => _startingChat.add(friendId));
+    try {
+      final convId = await SupabaseService.instance
+          .createOrGetDirectConversation(friendId);
+      if (!mounted) return;
+      if (convId != null) {
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => PrivateChatScreen(
+              chatId: convId,
+              otherUserId: friendId,
+              otherUserName: friend['name'] as String? ?? 'Usuário',
+              otherUserAvatar: friend['avatarUrl'] as String? ?? '',
+              otherUserAvatarSemantic: 'Foto de ${friend['name']}',
+            ),
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Não foi possível iniciar a conversa.')),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Não foi possível iniciar a conversa.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _startingChat.remove(friendId));
+    }
+  }
+
+  Widget _buildAvatar(Map<String, dynamic> friend, double size) {
+    final avatarUrl = friend['avatarUrl'] as String? ?? '';
+    final name = friend['name'] as String? ?? 'U';
+    final initial = name.isNotEmpty ? name[0].toUpperCase() : 'U';
+
+    if (avatarUrl.isNotEmpty &&
+        (avatarUrl.startsWith('http://') || avatarUrl.startsWith('https://'))) {
+      return ClipOval(
+        child: CustomImageWidget(
+          imageUrl: avatarUrl,
+          width: size,
+          height: size,
+          fit: BoxFit.cover,
+          semanticLabel: 'Foto de $name',
+        ),
+      );
+    }
+    return CircleAvatar(
+      radius: size / 2,
+      backgroundColor: AppTheme.primary.withAlpha(40),
+      child: Text(
+        initial,
+        style: TextStyle(
+          color: AppTheme.primary,
+          fontWeight: FontWeight.w700,
+          fontSize: size * 0.38,
+        ),
+      ),
+    );
+  }
+
   Color _neurodivColor(String type) {
     switch (type) {
       case 'TEA':
@@ -98,6 +168,8 @@ class _FriendsListPageState extends State<FriendsListPage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final currentUid = SupabaseService.instance.currentUserId ?? '';
+    final isOwnProfile = widget.userId == currentUid;
 
     return Scaffold(
       backgroundColor: theme.scaffoldBackgroundColor,
@@ -124,7 +196,7 @@ class _FriendsListPageState extends State<FriendsListPage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Amigos de ${widget.userName}',
+              isOwnProfile ? 'Meus Amigos' : 'Amigos de ${widget.userName}',
               style: theme.textTheme.titleMedium?.copyWith(
                 fontWeight: FontWeight.w700,
               ),
@@ -195,19 +267,33 @@ class _FriendsListPageState extends State<FriendsListPage> {
               itemBuilder: (context, index) {
                 final friend = _friends[index];
                 final neurodivType = friend['neurodivType'] as String? ?? '';
+                final friendId = friend['id'] as String? ?? '';
+                final isStarting = _startingChat.contains(friendId);
+                // Show chat button only when viewing own profile
+                final showChatButton = isOwnProfile && friendId != currentUid;
+
                 return ListTile(
                   contentPadding: const EdgeInsets.symmetric(
                     horizontal: 16,
                     vertical: 4,
                   ),
-                  leading: ClipOval(
-                    child: CustomImageWidget(
-                      imageUrl: friend['avatarUrl'] as String? ?? '',
-                      width: 48,
-                      height: 48,
-                      fit: BoxFit.cover,
-                      semanticLabel: 'Foto de ${friend['name']}',
-                    ),
+                  leading: GestureDetector(
+                    onTap: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => UserProfileScreen(
+                            userData: {
+                              'id': friend['id'],
+                              'name': friend['name'],
+                              'username': friend['username'],
+                              'avatarUrl': friend['avatarUrl'],
+                              'neurodivType': neurodivType,
+                            },
+                          ),
+                        ),
+                      );
+                    },
+                    child: _buildAvatar(friend, 48),
                   ),
                   title: Row(
                     children: [
@@ -252,6 +338,36 @@ class _FriendsListPageState extends State<FriendsListPage> {
                             color: theme.colorScheme.onSurfaceVariant,
                           ),
                         )
+                      : null,
+                  trailing: showChatButton
+                      ? isStarting
+                            ? SizedBox(
+                                width: 24,
+                                height: 24,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: AppTheme.primary,
+                                ),
+                              )
+                            : Tooltip(
+                                message: 'Iniciar conversa',
+                                child: IconButton(
+                                  onPressed: () => _startConversation(friend),
+                                  icon: Icon(
+                                    Icons.chat_bubble_outline_rounded,
+                                    color: AppTheme.primary,
+                                    size: 22,
+                                  ),
+                                  style: IconButton.styleFrom(
+                                    backgroundColor: AppTheme.primary.withAlpha(
+                                      20,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                  ),
+                                ),
+                              )
                       : null,
                   onTap: () {
                     Navigator.of(context).push(

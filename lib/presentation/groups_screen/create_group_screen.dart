@@ -2,11 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'dart:io';
+import 'dart:io' if (dart.library.io) 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import '../../services/supabase_service.dart';
-import '../../services/media_permission_service.dart';
 import '../../theme/app_theme.dart';
 
 class CreateGroupScreen extends StatefulWidget {
@@ -69,14 +68,6 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
   }
 
   Future<void> _pickImageFromGallery() async {
-    if (!await MediaPermissionService.request(camera: false)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Permissão para acessar fotos negada.')),
-        );
-      }
-      return;
-    }
     final picker = ImagePicker();
     final XFile? image = await picker.pickImage(
       source: ImageSource.gallery,

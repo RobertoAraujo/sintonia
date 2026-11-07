@@ -133,8 +133,12 @@ class _FirstTimeSetupScreenState extends State<FirstTimeSetupScreen>
             .update({
               if (_selectedNeurotype != null)
                 'neurodiv_type': _selectedNeurotype,
-              'hyperfocus_tags': _selectedHyperfocuses.toList(),
-              'comm_style': _selectedCommStyles.toList(),
+              'hyperfocuses': _selectedHyperfocuses
+                  .map((h) => {'name': h, 'color': 0xFF4A90D9})
+                  .toList(),
+              'communication_preferences': {
+                'comm_styles': _selectedCommStyles.toList(),
+              },
               'onboarding_completed': true,
             })
             .eq('id', uid);

@@ -36,6 +36,8 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
               ? DateTime.tryParse(r['created_at'].toString())?.toLocal()
               : null;
           final tags = (r['tags'] as List?)?.cast<String>() ?? [];
+          final isPrivate = r['is_private'] as bool? ?? true;
+          final friendsOnly = r['friends_only'] as bool? ?? true;
           return {
             'id': r['id'] ?? '',
             'date': createdAt != null ? _formatDate(createdAt) : 'Hoje',
@@ -47,6 +49,8 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
             'petName': null,
             'petImageUrl': null,
             'tags': tags,
+            'is_private': isPrivate,
+            'friends_only': friendsOnly,
           };
         }).toList();
         _isLoading = false;
@@ -79,6 +83,96 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
     return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
   }
 
+  /// Returns the visibility label and icon for an entry
+  _VisibilityInfo _getVisibilityInfo(Map<String, dynamic> entry) {
+    final isPrivate = entry['is_private'] as bool? ?? true;
+    final friendsOnly = entry['friends_only'] as bool? ?? true;
+    if (isPrivate && !friendsOnly) {
+      // Truly private — only me
+      return _VisibilityInfo(
+        label: 'Privado',
+        icon: Icons.lock_rounded,
+        color: Colors.red.shade400,
+      );
+    } else if (friendsOnly) {
+      // Friends only (default)
+      return _VisibilityInfo(
+        label: 'Amigos',
+        icon: Icons.people_rounded,
+        color: AppTheme.primary,
+      );
+    } else {
+      // Public
+      return _VisibilityInfo(
+        label: 'Público',
+        icon: Icons.public_rounded,
+        color: Colors.green.shade600,
+      );
+    }
+  }
+
+  Future<void> _toggleVisibility(Map<String, dynamic> entry) async {
+    final entryId = entry['id'] as String;
+    final isPrivate = entry['is_private'] as bool? ?? true;
+    final friendsOnly = entry['friends_only'] as bool? ?? true;
+
+    // Cycle: friends_only → private → public → friends_only
+    bool newIsPrivate;
+    bool newFriendsOnly;
+
+    if (friendsOnly && isPrivate) {
+      // Currently friends → go to private (only me)
+      newIsPrivate = true;
+      newFriendsOnly = false;
+    } else if (isPrivate && !friendsOnly) {
+      // Currently private → go to public
+      newIsPrivate = false;
+      newFriendsOnly = false;
+    } else {
+      // Currently public → go back to friends
+      newIsPrivate = true;
+      newFriendsOnly = true;
+    }
+
+    // Optimistic update
+    setState(() {
+      final idx = _entries.indexWhere((e) => e['id'] == entryId);
+      if (idx != -1) {
+        _entries[idx] = {
+          ..._entries[idx],
+          'is_private': newIsPrivate,
+          'friends_only': newFriendsOnly,
+        };
+      }
+    });
+
+    final success = await SupabaseService.instance.updateDiaryEntryVisibility(
+      entryId: entryId,
+      isPrivate: newIsPrivate,
+      friendsOnly: newFriendsOnly,
+    );
+
+    if (!success && mounted) {
+      // Revert on failure
+      setState(() {
+        final idx = _entries.indexWhere((e) => e['id'] == entryId);
+        if (idx != -1) {
+          _entries[idx] = {
+            ..._entries[idx],
+            'is_private': isPrivate,
+            'friends_only': friendsOnly,
+          };
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Erro ao alterar visibilidade. Tente novamente.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
   void _showAddEntryModal() {
     final titleCtrl = TextEditingController();
     final contentCtrl = TextEditingController();
@@ -90,11 +184,9 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      // Ensure the sheet can expand above the nav bar
       useRootNavigator: true,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setModalState) {
-          // Account for keyboard + bottom safe area (nav bar)
           final bottomInset = MediaQuery.of(ctx).viewInsets.bottom;
           final bottomPadding = MediaQuery.of(ctx).padding.bottom;
           return Padding(
@@ -198,8 +290,37 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
                         ),
                       ),
                     ),
+                    const SizedBox(height: 8),
+                    // Visibility info note
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: AppTheme.primary.withAlpha(15),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.people_rounded,
+                            size: 16,
+                            color: AppTheme.primary,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Visível apenas para seus amigos por padrão',
+                              style: Theme.of(ctx).textTheme.bodySmall
+                                  ?.copyWith(color: AppTheme.primary),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                     const SizedBox(height: 16),
-                    // Save to diary button
+                    // Save to diary button (friends_only by default)
                     SizedBox(
                       width: double.infinity,
                       child: FilledButton.icon(
@@ -217,6 +338,7 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
                                       title: titleCtrl.text.trim(),
                                       mood: selectedMood,
                                       isPrivate: true,
+                                      friendsOnly: true,
                                     );
                                 if (!ctx.mounted) return;
                                 Navigator.pop(ctx);
@@ -271,18 +393,22 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
                                     ? '$selectedMood $title\n\n$content'
                                     : '$selectedMood $content';
 
-                                // Save diary entry first (private)
+                                // Save diary entry (public)
                                 await SupabaseService.instance.addDiaryEntry(
                                   content: content,
                                   title: title,
                                   mood: selectedMood,
                                   isPrivate: false,
+                                  friendsOnly: false,
                                 );
 
                                 // Also post to feed
                                 final postResult = await SupabaseService
                                     .instance
-                                    .createPost(content: postContent);
+                                    .createPost(
+                                      content: postContent,
+                                      postType: 'diary',
+                                    );
 
                                 if (!ctx.mounted) return;
                                 Navigator.pop(ctx);
@@ -427,6 +553,7 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
                 itemBuilder: (_, i) {
                   final entry = _entries[i];
                   final tags = (entry['tags'] as List?)?.cast<String>() ?? [];
+                  final visInfo = _getVisibilityInfo(entry);
                   return Container(
                     margin: const EdgeInsets.only(bottom: 14),
                     padding: const EdgeInsets.all(16),
@@ -463,6 +590,42 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
                                     ),
                                   ),
                                 ],
+                              ),
+                            ),
+                            // Visibility toggle button
+                            GestureDetector(
+                              onTap: () => _toggleVisibility(entry),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 5,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: visInfo.color.withAlpha(20),
+                                  borderRadius: BorderRadius.circular(20),
+                                  border: Border.all(
+                                    color: visInfo.color.withAlpha(60),
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      visInfo.icon,
+                                      size: 13,
+                                      color: visInfo.color,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      visInfo.label,
+                                      style: theme.textTheme.labelSmall
+                                          ?.copyWith(
+                                            color: visInfo.color,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
                           ],
@@ -509,4 +672,16 @@ class _ProfileDiaryScreenState extends State<ProfileDiaryScreen> {
             ),
     );
   }
+}
+
+class _VisibilityInfo {
+  final String label;
+  final IconData icon;
+  final Color color;
+
+  const _VisibilityInfo({
+    required this.label,
+    required this.icon,
+    required this.color,
+  });
 }

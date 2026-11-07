@@ -86,6 +86,9 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
       postId: postId,
       onNewComment: (newComment) async {
         if (!mounted) return;
+        final newId = newComment['id'] as String? ?? '';
+        // Deduplicate: skip if this comment was already added locally
+        if (newId.isNotEmpty && _comments.any((c) => c['id'] == newId)) return;
         // Fetch author info
         final authorId = newComment['author_id'] as String? ?? '';
         String authorName = 'Usuário';
@@ -100,7 +103,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
         if (mounted) {
           setState(() {
             _comments.add({
-              'id': newComment['id'] ?? '',
+              'id': newId,
               'author': authorName,
               'avatarUrl': authorAvatar,
               'text': newComment['content'] ?? '',
@@ -272,9 +275,9 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
     final theme = Theme.of(context);
     final post = widget.post;
     final author = widget.author;
-    final hasImage =
-        (post['hasImage'] as bool?) ??
-        ((post['imageUrl'] != null && (post['imageUrl'] as String).isNotEmpty));
+    // Only treat as image post when there is an actual non-empty image URL
+    final imageUrl = post['imageUrl'] as String?;
+    final hasImage = imageUrl != null && imageUrl.isNotEmpty;
     final caption =
         post['caption'] as String? ??
         post['text'] as String? ??
@@ -282,6 +285,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
         '';
 
     return Scaffold(
+      resizeToAvoidBottomInset: true,
       backgroundColor: theme.scaffoldBackgroundColor,
       appBar: AppBar(
         backgroundColor: theme.scaffoldBackgroundColor,
@@ -363,14 +367,12 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                       ),
                     ),
 
-                  // Post image
-                  if (hasImage &&
-                      post['imageUrl'] != null &&
-                      (post['imageUrl'] as String).isNotEmpty)
+                  // Post image — only shown when there is a real image URL
+                  if (hasImage)
                     AspectRatio(
                       aspectRatio: 1,
                       child: CustomImageWidget(
-                        imageUrl: post['imageUrl'] as String,
+                        imageUrl: imageUrl,
                         width: double.infinity,
                         height: double.infinity,
                         fit: BoxFit.cover,
@@ -378,18 +380,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                             post['semanticLabel'] as String? ??
                             post['image_semantic'] as String? ??
                             'Imagem do post',
-                      ),
-                    )
-                  else
-                    Container(
-                      height: 200,
-                      color: theme.colorScheme.surfaceContainerHighest,
-                      child: Center(
-                        child: Icon(
-                          Icons.article_outlined,
-                          size: 56,
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
+                        errorWidget: const SizedBox.shrink(),
                       ),
                     ),
 
@@ -573,19 +564,23 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                       },
                     ),
 
-                  const SizedBox(height: 80),
+                  const SizedBox(height: 16),
                 ],
               ),
             ),
           ),
 
-          // Comment input bar
+          // Comment input bar — anchored at the bottom above the keyboard
           Container(
-            padding: EdgeInsets.fromLTRB(
-              16,
-              8,
-              16,
-              MediaQuery.of(context).padding.bottom + 8,
+            padding: EdgeInsets.only(
+              left: 16,
+              right: 16,
+              top: 8,
+              bottom: MediaQuery.of(context).viewInsets.bottom > 0
+                  ? 8
+                  : MediaQuery.of(context).padding.bottom > 0
+                  ? MediaQuery.of(context).padding.bottom
+                  : 8,
             ),
             decoration: BoxDecoration(
               color: theme.colorScheme.surface,

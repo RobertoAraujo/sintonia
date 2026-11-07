@@ -29,8 +29,8 @@ class PetService {
   // UPLOAD & UPDATE PET PHOTO
   // ─────────────────────────────────────────────────────────────
 
-  /// Uploads [imageBytes] to the `avatars` bucket under the path
-  /// `<userId>/pets/<timestamp>.<ext>`, updates `pets.photo_url`, applies
+  /// Uploads [imageBytes] to the `pets` bucket under the path
+  /// `<userId>/<timestamp>.<ext>`, updates `pets.photo_url`, applies
   /// cache-busting, notifies [PetAvatarNotifier], and returns the final URL.
   ///
   /// Returns `null` if the user is not authenticated, the pet does not belong
@@ -56,18 +56,18 @@ class PetService {
         return null;
       }
 
-      // 2. Upload to Storage: avatars/<uid>/pets/<timestamp>.<ext>
+      // 2. Upload to Storage: pets/<uid>/<timestamp>.<ext>
       final safeExt = ['jpg', 'jpeg', 'png', 'webp'].contains(fileExtension)
           ? fileExtension
           : 'jpg';
       final storagePath =
-          '$uid/pets/pet_${DateTime.now().millisecondsSinceEpoch}.$safeExt';
+          '$uid/pet_${DateTime.now().millisecondsSinceEpoch}.$safeExt';
       final mimeType = (safeExt == 'jpg' || safeExt == 'jpeg')
           ? 'image/jpeg'
           : 'image/$safeExt';
 
       await _client.storage
-          .from('avatars')
+          .from('pets')
           .uploadBinary(
             storagePath,
             Uint8List.fromList(imageBytes),
@@ -75,7 +75,7 @@ class PetService {
           );
 
       // 3. Build the public URL (bucket is public)
-      final baseUrl = _client.storage.from('avatars').getPublicUrl(storagePath);
+      final baseUrl = _client.storage.from('pets').getPublicUrl(storagePath);
 
       // 4. Cache-busting: append ?v=<epoch-ms> so CachedNetworkImage always
       //    fetches the latest version instead of serving the stale cached copy.
